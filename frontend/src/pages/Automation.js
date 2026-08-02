@@ -127,7 +127,7 @@ export default function Automation() {
             <div className="grid sm:grid-cols-3 gap-3">
               {[
                 { label: "Email · SMTP", live: integ.email_live, icon: Mail, hint: integ.sender_email || "Add SMTP creds" },
-                { label: "Leads · Apollo", live: integ.leads_live, icon: Radar, hint: integ.leads_live ? "Real leads live" : "Add APOLLO_API_KEY" },
+                { label: "Leads · Apollo", live: integ.leads_live, icon: Radar, hint: integ.leads_live ? "Real leads live" : (integ.leads_blocked ? "Apollo Free plan — upgrade to enable API" : "Add APOLLO_API_KEY") },
                 { label: "WhatsApp · Twilio", live: integ.whatsapp_live, icon: MessageCircle, hint: integ.whatsapp_live ? "Auto-send live" : "Add Twilio creds" },
               ].map((it) => (
                 <div key={it.label} className={`p-3 rounded-sm border ${it.live ? "border-emerald-500/30 bg-emerald-500/10" : "border-zinc-800 bg-[#0f0f11]"}`}>

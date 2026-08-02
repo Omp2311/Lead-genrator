@@ -51,6 +51,7 @@ TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()
 
 FOLLOWUP_DELAYS_DAYS = [3, 6]  # step 2 at +3 days, step 3 at +6 days
+_apollo_ok = None  # None=untested, True=working, False=blocked (e.g. free plan)
 
 def _email_configured() -> bool:
     return bool((SMTP_HOST and SMTP_USER and SMTP_PASSWORD) or RESEND_API_KEY)
@@ -60,7 +61,8 @@ def integrations_status() -> dict:
         "email_live": _email_configured(),
         "email_provider": "smtp" if (SMTP_HOST and SMTP_USER) else ("resend" if RESEND_API_KEY else None),
         "sender_email": SENDER_EMAIL if _email_configured() else None,
-        "leads_live": bool(APOLLO_API_KEY),
+        "leads_live": bool(APOLLO_API_KEY) and _apollo_ok is not False,
+        "leads_blocked": bool(APOLLO_API_KEY) and _apollo_ok is False,
         "whatsapp_live": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM),
     }
 
@@ -277,6 +279,7 @@ async def send_whatsapp(to_phone: str, body: str, allow: bool = True) -> dict:
 # Real lead sourcing via Apollo (falls back to AI demo leads)
 # ---------------------------------------------------------------------------
 async def fetch_apollo_leads(regions, industries, count) -> List[dict]:
+    global _apollo_ok
     headers = {"x-api-key": APOLLO_API_KEY, "Content-Type": "application/json",
                "Accept": "application/json", "Cache-Control": "no-cache"}
     titles = ["CEO", "CTO", "Founder", "VP Engineering", "IT Director", "Head of Growth"]
@@ -292,7 +295,10 @@ async def fetch_apollo_leads(regions, industries, count) -> List[dict]:
         resp = await c.post("https://api.apollo.io/api/v1/mixed_people/api_search",
                             params=params, headers=headers, json={})
     if resp.is_error:
+        if resp.status_code in (401, 403):
+            _apollo_ok = False
         raise RuntimeError(f"Apollo search error {resp.status_code}")
+    _apollo_ok = True
     people = resp.json().get("people", [])[:count]
 
     ids = [p["id"] for p in people if p.get("id")]
