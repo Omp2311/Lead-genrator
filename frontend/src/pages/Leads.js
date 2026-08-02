@@ -1,13 +1,26 @@
 import { useEffect, useState } from "react";
 import api from "@/lib/api";
-import { Users, MapPin, Building2, Mail, Phone, MessageCircle, ExternalLink } from "lucide-react";
+import { toast } from "sonner";
+import { Users, MapPin, Building2, Mail, Phone, MessageCircle, ExternalLink, CheckCircle2 } from "lucide-react";
 
 export default function Leads() {
   const [leads, setLeads] = useState(null);
 
+  const load = () => api.get("/leads").then((res) => setLeads(res.data)).catch(() => setLeads([]));
+
   useEffect(() => {
-    api.get("/leads").then((res) => setLeads(res.data)).catch(() => setLeads([]));
+    load();
   }, []);
+
+  const markReplied = async (id) => {
+    try {
+      const r = await api.post(`/leads/${id}/replied`);
+      toast.success(`Marked as replied · ${r.data.cancelled_followups} follow-up(s) cancelled`);
+      setLeads((prev) => prev.map((l) => (l.id === id ? { ...l, replied: true } : l)));
+    } catch (e) {
+      toast.error("Could not update lead.");
+    }
+  };
 
   return (
     <div className="p-8 max-w-7xl">
@@ -71,6 +84,20 @@ export default function Leads() {
               <p className="mt-4 text-xs text-zinc-400 bg-[#0f0f11] border border-zinc-800/80 rounded-sm p-2.5 leading-relaxed">
                 <span className="text-cyan-400/80">Signal:</span> {l.pain_point}
               </p>
+
+              {l.replied ? (
+                <div className="mt-3 flex items-center gap-2 text-xs text-emerald-400" data-testid={`lead-replied-${i}`}>
+                  <CheckCircle2 className="w-4 h-4" /> Replied — follow-ups stopped
+                </div>
+              ) : (
+                <button
+                  onClick={() => markReplied(l.id)}
+                  data-testid={`lead-mark-replied-${i}`}
+                  className="mt-3 flex items-center gap-2 text-xs text-zinc-400 hover:text-emerald-400 transition-colors"
+                >
+                  <CheckCircle2 className="w-4 h-4" /> Mark as replied
+                </button>
+              )}
 
               {l.whatsapp_link && (
                 <a

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import api from "@/lib/api";
 import { toast } from "sonner";
-import { Zap, Loader2, Save } from "lucide-react";
+import { Zap, Loader2, Save, Mail, Radar, MessageCircle, Send, Clock, Circle } from "lucide-react";
 
 const TagInput = ({ label, values, onChange, testid }) => {
   const [text, setText] = useState("");
@@ -35,12 +35,44 @@ const TagInput = ({ label, values, onChange, testid }) => {
 
 export default function Automation() {
   const [s, setS] = useState(null);
+  const [integ, setInteg] = useState(null);
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [processing, setProcessing] = useState(false);
 
   useEffect(() => {
     api.get("/settings").then((r) => setS(r.data)).catch(() => {});
+    api.get("/integrations/status").then((r) => setInteg(r.data)).catch(() => {});
   }, []);
+
+  const sendTest = async () => {
+    setTesting(true);
+    try {
+      const r = await api.post("/integrations/test-email");
+      if (r.data.status === "sent" && !r.data.simulated)
+        toast.success("Test email sent — check your inbox!");
+      else if (r.data.simulated)
+        toast.info("Email not configured — sending is simulated.");
+      else toast.error(`Send failed: ${r.data.error || "unknown"}`);
+    } catch (e) {
+      toast.error("Test failed.");
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const processFollowups = async () => {
+    setProcessing(true);
+    try {
+      const r = await api.post("/followups/process");
+      toast.success(`${r.data.sent} due follow-up(s) processed.`);
+    } catch (e) {
+      toast.error("Could not process follow-ups.");
+    } finally {
+      setProcessing(false);
+    }
+  };
 
   const save = async () => {
     setSaving(true);
@@ -65,7 +97,8 @@ export default function Automation() {
         offer: s.offer,
         tone: s.tone,
       });
-      toast.success(`${r.data.leads} leads · ${r.data.emails} emails generated`);
+      const mode = r.data.email_live && r.data.lead_source === "apollo" ? "delivered" : "drafted (demo)";
+      toast.success(`${r.data.leads} leads · ${r.data.emails} emails ${mode}`);
     } catch (e) {
       toast.error("Run failed.");
     } finally {
@@ -88,6 +121,56 @@ export default function Automation() {
       </div>
 
       <div className="space-y-4">
+        {integ && (
+          <div className="bg-[#18181B] border border-zinc-800 rounded-md p-6">
+            <h3 className="font-display font-semibold text-lg mb-4">Integrations</h3>
+            <div className="grid sm:grid-cols-3 gap-3">
+              {[
+                { label: "Email · SMTP", live: integ.email_live, icon: Mail, hint: integ.sender_email || "Add SMTP creds" },
+                { label: "Leads · Apollo", live: integ.leads_live, icon: Radar, hint: integ.leads_live ? "Real leads live" : "Add APOLLO_API_KEY" },
+                { label: "WhatsApp · Twilio", live: integ.whatsapp_live, icon: MessageCircle, hint: integ.whatsapp_live ? "Auto-send live" : "Add Twilio creds" },
+              ].map((it) => (
+                <div key={it.label} className={`p-3 rounded-sm border ${it.live ? "border-emerald-500/30 bg-emerald-500/10" : "border-zinc-800 bg-[#0f0f11]"}`}>
+                  <div className="flex items-center gap-2">
+                    <it.icon className={`w-4 h-4 ${it.live ? "text-emerald-400" : "text-zinc-500"}`} />
+                    <span className="text-sm font-medium">{it.label}</span>
+                    <span className={`ml-auto flex items-center gap-1 text-xs ${it.live ? "text-emerald-400" : "text-zinc-500"}`}>
+                      <Circle className={`w-2 h-2 ${it.live ? "fill-emerald-400 text-emerald-400" : "fill-zinc-600 text-zinc-600"}`} /> {it.live ? "LIVE" : "OFF"}
+                    </span>
+                  </div>
+                  <p className="text-xs text-zinc-500 mt-1.5 truncate">{it.hint}</p>
+                </div>
+              ))}
+            </div>
+            <div className="flex flex-wrap gap-3 mt-4">
+              <button
+                data-testid="send-test-email-button"
+                onClick={sendTest}
+                disabled={testing}
+                className="flex items-center gap-2 bg-zinc-800 text-white text-sm font-medium px-4 py-2 rounded-sm hover:bg-zinc-700 transition-colors disabled:opacity-60"
+              >
+                {testing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                Send test email
+              </button>
+              <button
+                data-testid="process-followups-button"
+                onClick={processFollowups}
+                disabled={processing}
+                className="flex items-center gap-2 bg-zinc-800 text-white text-sm font-medium px-4 py-2 rounded-sm hover:bg-zinc-700 transition-colors disabled:opacity-60"
+              >
+                {processing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Clock className="w-4 h-4" />}
+                Process due follow-ups
+              </button>
+            </div>
+            {!integ.leads_live && (
+              <p className="text-xs text-amber-400/80 mt-3 leading-relaxed">
+                Note: leads are AI-generated demo data until Apollo is connected. To protect your email
+                reputation, real sending only fires for real (Apollo) leads — demo emails stay simulated.
+              </p>
+            )}
+          </div>
+        )}
+
         <div className="bg-[#18181B] border border-zinc-800 rounded-md p-6 flex items-center justify-between">
           <div>
             <h3 className="font-display font-semibold text-lg">Daily autopilot</h3>

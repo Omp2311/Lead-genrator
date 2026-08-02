@@ -63,21 +63,44 @@ export default function Outbox() {
             >
               <div className="flex items-start justify-between gap-3 mb-2">
                 <div>
-                  <p className="font-display font-semibold">{e.subject}</p>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {e.channel === "email" && (
+                      <span className="text-[10px] uppercase tracking-wider bg-cyan-400/10 text-cyan-300 px-1.5 py-0.5 rounded-sm">
+                        {e.type === "follow_up" ? `Follow-up ${e.step - 1}` : "Initial"}
+                      </span>
+                    )}
+                    <p className="font-display font-semibold">{e.subject}</p>
+                  </div>
                   <p className="text-xs text-zinc-500 mt-0.5">
                     To {e.contact_name} · {e.company} ·{" "}
                     <span className="font-mono">{e.to_email}</span>
+                    {e.status === "scheduled" && e.scheduled_for && (
+                      <span className="text-amber-400/80"> · scheduled {new Date(e.scheduled_for).toLocaleDateString()}</span>
+                    )}
                   </p>
                 </div>
-                <span
-                  className={`text-[10px] uppercase tracking-wider px-2 py-1 rounded-sm shrink-0 ${
-                    e.status === "sent"
-                      ? "bg-emerald-500/10 text-emerald-400"
-                      : "bg-amber-500/10 text-amber-400"
-                  }`}
-                >
-                  {e.status}
-                </span>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {e.simulated && e.status === "sent" && (
+                    <span className="text-[10px] uppercase tracking-wider px-2 py-1 rounded-sm bg-zinc-700/50 text-zinc-400">
+                      simulated
+                    </span>
+                  )}
+                  <span
+                    className={`text-[10px] uppercase tracking-wider px-2 py-1 rounded-sm ${
+                      e.status === "sent"
+                        ? "bg-emerald-500/10 text-emerald-400"
+                        : e.status === "scheduled"
+                        ? "bg-amber-500/10 text-amber-400"
+                        : e.status === "failed"
+                        ? "bg-red-500/10 text-red-400"
+                        : e.status === "cancelled"
+                        ? "bg-zinc-700/40 text-zinc-500"
+                        : "bg-amber-500/10 text-amber-400"
+                    }`}
+                  >
+                    {e.status}
+                  </span>
+                </div>
               </div>
               {e.channel === "email" ? (
                 <pre className="text-sm text-zinc-300 whitespace-pre-wrap font-sans leading-relaxed mt-3 border-t border-zinc-800 pt-3">

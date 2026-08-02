@@ -10,7 +10,7 @@ import {
   Tooltip,
   CartesianGrid,
 } from "recharts";
-import { Users, Send, MessageCircle, Phone, Zap, Loader2, TrendingUp } from "lucide-react";
+import { Users, Send, MessageCircle, Phone, Zap, Loader2, TrendingUp, Clock, CheckCircle2, Mail, Radar, Circle } from "lucide-react";
 
 const StatCard = ({ label, value, sub, icon: Icon, accent, testid }) => (
   <div
@@ -26,6 +26,22 @@ const StatCard = ({ label, value, sub, icon: Icon, accent, testid }) => (
     </div>
     <div className="font-display text-3xl font-black tracking-tight">{value}</div>
     {sub && <p className="text-xs text-zinc-500 mt-1">{sub}</p>}
+  </div>
+);
+
+const IntegrationPill = ({ label, live, icon: Icon, testid }) => (
+  <div
+    data-testid={testid}
+    className={`flex items-center gap-2 px-3 py-2 rounded-sm border text-xs ${
+      live ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300" : "border-zinc-800 bg-[#18181B] text-zinc-500"
+    }`}
+  >
+    <Icon className="w-3.5 h-3.5" />
+    <span className="font-medium">{label}</span>
+    <span className={`ml-auto flex items-center gap-1 ${live ? "text-emerald-400" : "text-zinc-500"}`}>
+      <Circle className={`w-2 h-2 ${live ? "fill-emerald-400 text-emerald-400" : "fill-zinc-600 text-zinc-600"}`} />
+      {live ? "LIVE" : "OFF"}
+    </span>
   </div>
 );
 
@@ -86,6 +102,12 @@ export default function Dashboard() {
         <div className="text-zinc-500 font-mono text-sm">Loading telemetry…</div>
       ) : (
         <>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-6">
+            <IntegrationPill testid="integ-email" label="Email · SMTP" live={stats.integrations?.email_live} icon={Mail} />
+            <IntegrationPill testid="integ-leads" label="Leads · Apollo" live={stats.integrations?.leads_live} icon={Radar} />
+            <IntegrationPill testid="integ-whatsapp" label="WhatsApp · Twilio" live={stats.integrations?.whatsapp_live} icon={MessageCircle} />
+          </div>
+
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
             <StatCard testid="stat-emails-sent" label="Emails sent" value={stats.emails_sent} sub="Cold emails dispatched" icon={Send} accent />
             <StatCard testid="stat-leads" label="Leads found" value={stats.total_leads} sub="Decision makers discovered" icon={Users} />
@@ -133,7 +155,15 @@ export default function Dashboard() {
                   ? "Autopilot is ON. The agent discovers leads, writes personalized emails and queues WhatsApp proposals every day — automatically."
                   : "Autopilot is currently OFF. Turn it on in Automation to run hands-free daily."}
               </p>
-              <div className="mt-auto pt-4">
+              <div className="mt-auto pt-4 space-y-2">
+                <div className="flex items-center justify-between text-sm border-t border-zinc-800 pt-3">
+                  <span className="flex items-center gap-2 text-zinc-400"><Clock className="w-3.5 h-3.5 text-amber-400" /> Follow-ups queued</span>
+                  <span className="font-display font-bold" data-testid="stat-followups">{stats.followups_queued}</span>
+                </div>
+                <div className="flex items-center justify-between text-sm">
+                  <span className="flex items-center gap-2 text-zinc-400"><CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> Replied</span>
+                  <span className="font-display font-bold" data-testid="stat-replied">{stats.replied}</span>
+                </div>
                 <span
                   className={`inline-flex items-center gap-2 text-xs font-medium px-3 py-1.5 rounded-sm ${
                     stats.auto_enabled

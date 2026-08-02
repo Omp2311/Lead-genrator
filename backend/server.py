@@ -23,6 +23,8 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
 
 import httpx
+import smtplib
+from email.message import EmailMessage
 from emergentintegrations.llm.chat import LlmChat, UserMessage
 
 # ---------------------------------------------------------------------------
@@ -39,6 +41,10 @@ JWT_ALGORITHM = "HS256"
 # Optional third-party providers (features go live automatically when keys are set)
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "onboarding@resend.dev").strip()
+SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587") or 587)
+SMTP_USER = os.environ.get("SMTP_USER", "").strip()
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "").replace(" ", "").strip()
 APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY", "").strip()
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
@@ -46,10 +52,14 @@ TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()
 
 FOLLOWUP_DELAYS_DAYS = [3, 6]  # step 2 at +3 days, step 3 at +6 days
 
+def _email_configured() -> bool:
+    return bool((SMTP_HOST and SMTP_USER and SMTP_PASSWORD) or RESEND_API_KEY)
+
 def integrations_status() -> dict:
     return {
-        "email_live": bool(RESEND_API_KEY),
-        "sender_email": SENDER_EMAIL if RESEND_API_KEY else None,
+        "email_live": _email_configured(),
+        "email_provider": "smtp" if (SMTP_HOST and SMTP_USER) else ("resend" if RESEND_API_KEY else None),
+        "sender_email": SENDER_EMAIL if _email_configured() else None,
         "leads_live": bool(APOLLO_API_KEY),
         "whatsapp_live": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM),
     }
@@ -208,7 +218,16 @@ def _body_to_html(body: str) -> str:
     return ("<div style=\"font-family:Arial,Helvetica,sans-serif;font-size:14px;"
             "line-height:1.6;color:#111\">" + safe.replace("\n", "<br>") + "</div>")
 
-async def send_email(to_email: str, subject: str, body: str) -> dict:
+async def send_email(to_email: str, subject: str, body: str, allow: bool = True) -> dict:
+    if not allow:
+        return {"status": "sent", "simulated": True, "provider_id": None, "error": None}
+    if SMTP_HOST and SMTP_USER and SMTP_PASSWORD:
+        try:
+            await asyncio.to_thread(_smtp_send_sync, to_email, subject, body)
+            return {"status": "sent", "simulated": False, "provider_id": "smtp", "error": None}
+        except Exception as e:
+            logger.error(f"SMTP send failed: {e}")
+            return {"status": "failed", "simulated": False, "provider_id": None, "error": str(e)}
     if not RESEND_API_KEY:
         return {"status": "sent", "simulated": True, "provider_id": None, "error": None}
     try:
@@ -223,8 +242,22 @@ async def send_email(to_email: str, subject: str, body: str) -> dict:
         logger.error(f"Resend send failed: {e}")
         return {"status": "failed", "simulated": False, "provider_id": None, "error": str(e)}
 
-async def send_whatsapp(to_phone: str, body: str) -> dict:
-    if not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM):
+
+def _smtp_send_sync(to_email: str, subject: str, body: str):
+    msg = EmailMessage()
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.set_content(body)
+    msg.add_alternative(_body_to_html(body), subtype="html")
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+        s.ehlo()
+        s.starttls()
+        s.login(SMTP_USER, SMTP_PASSWORD)
+        s.send_message(msg)
+
+async def send_whatsapp(to_phone: str, body: str, allow: bool = True) -> dict:
+    if not allow or not (TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM):
         return {"status": "ready", "simulated": True, "sid": None, "error": None}
     try:
         from twilio.rest import Client
@@ -346,57 +379,132 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
     if tone:
         settings = {**settings, "tone": tone}
 
-    leads = await generate_leads(settings, count, region, industry)
+    leads, lead_source = await source_leads(settings, count, region, industry)
+    deliver = _email_configured() and lead_source == "apollo"
     emails = await generate_emails(settings, leads)
     email_by_i = {e.get("i"): e for e in emails}
+    try:
+        fups = await generate_followups(settings, leads)
+        fups_by_i = {f.get("i"): (f.get("followups") or []) for f in fups}
+    except Exception as e:
+        logger.error(f"Follow-up generation failed: {e}")
+        fups_by_i = {}
 
-    now = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    sender = settings.get("sender_name", "Alex")
     created_emails = 0
     created_leads = 0
+    real_sent = 0
+    wa_sent = 0
+
     for idx, lead in enumerate(leads):
         lead_id = str(uuid.uuid4())
         phone = (lead.get("phone") or "").strip()
-        wa = whatsapp_link(phone, lead.get("company", ""), settings.get("sender_name", "Alex"),
+        wa = whatsapp_link(phone, lead.get("company", ""), sender,
                            settings.get("offer", "")) if phone else None
-        lead_doc = {
+        await db.leads.insert_one({
             "_id": lead_id, "user_id": user_id, "company": lead.get("company", ""),
             "contact_name": lead.get("contact_name", ""), "title": lead.get("title", ""),
             "email": lead.get("email", ""), "phone": phone, "location": lead.get("location", ""),
             "industry": lead.get("industry", ""), "website": lead.get("website", ""),
             "pain_point": lead.get("pain_point", ""), "whatsapp_link": wa,
-            "created_at": now, "source": source,
-        }
-        await db.leads.insert_one(lead_doc)
+            "created_at": now, "source": source, "lead_source": lead_source, "replied": False,
+        })
         created_leads += 1
 
         em = email_by_i.get(idx, {})
-        email_doc = {
+        subject = em.get("subject", "Quick question")
+        body = em.get("body", "")
+        to_email = lead.get("email", "")
+        result = await send_email(to_email, subject, body, allow=deliver) if to_email else \
+            {"status": "failed", "simulated": False, "provider_id": None, "error": "no email"}
+        if result["status"] == "sent" and not result.get("simulated"):
+            real_sent += 1
+        await db.emails.insert_one({
             "_id": str(uuid.uuid4()), "user_id": user_id, "lead_id": lead_id,
             "company": lead.get("company", ""), "contact_name": lead.get("contact_name", ""),
-            "to_email": lead.get("email", ""),
-            "subject": em.get("subject", "Quick question"),
-            "body": em.get("body", ""),
-            "channel": "email", "status": "sent", "created_at": now, "sent_at": now,
-        }
-        await db.emails.insert_one(email_doc)
+            "to_email": to_email, "subject": subject, "body": body,
+            "channel": "email", "step": 1, "type": "initial",
+            "status": result["status"], "simulated": result.get("simulated", False),
+            "error": result.get("error"), "created_at": now,
+            "deliverable": deliver, "lead_source": lead_source,
+            "sent_at": now if result["status"] == "sent" else None,
+        })
         created_emails += 1
 
-        if wa:
+        # Schedule follow-ups (sent later if the lead hasn't replied)
+        for step_i, fu in enumerate(fups_by_i.get(idx, [])[:2]):
+            delay = FOLLOWUP_DELAYS_DAYS[step_i] if step_i < len(FOLLOWUP_DELAYS_DAYS) else 6
+            scheduled_for = (now_dt + timedelta(days=delay)).isoformat()
             await db.emails.insert_one({
                 "_id": str(uuid.uuid4()), "user_id": user_id, "lead_id": lead_id,
                 "company": lead.get("company", ""), "contact_name": lead.get("contact_name", ""),
-                "to_email": phone, "subject": "WhatsApp proposal",
-                "body": f"WhatsApp proposal ready for {lead.get('company','')}.",
-                "channel": "whatsapp", "status": "ready", "whatsapp_link": wa,
-                "created_at": now, "sent_at": None,
+                "to_email": to_email, "subject": fu.get("subject", "Re: quick follow-up"),
+                "body": fu.get("body", ""), "channel": "email", "step": step_i + 2,
+                "type": "follow_up", "status": "scheduled", "simulated": False,
+                "error": None, "created_at": now, "sent_at": None,
+                "deliverable": deliver, "lead_source": lead_source,
+                "scheduled_for": scheduled_for,
             })
 
+        # WhatsApp proposal
+        if wa:
+            wa_body = (f"Hi {lead.get('contact_name','').split(' ')[0]}, this is {sender}. "
+                       f"I put together a quick proposal for {lead.get('company','')} on "
+                       f"{settings.get('offer','')}. Do you have 2 minutes?")
+            wa_res = await send_whatsapp(phone, wa_body, allow=(lead_source == "apollo"))
+            if wa_res["status"] == "sent" and not wa_res.get("simulated"):
+                wa_sent += 1
+            await db.emails.insert_one({
+                "_id": str(uuid.uuid4()), "user_id": user_id, "lead_id": lead_id,
+                "company": lead.get("company", ""), "contact_name": lead.get("contact_name", ""),
+                "to_email": phone, "subject": "WhatsApp proposal", "body": wa_body,
+                "channel": "whatsapp", "step": 1, "type": "initial",
+                "status": wa_res["status"], "simulated": wa_res.get("simulated", False),
+                "error": wa_res.get("error"), "whatsapp_link": wa,
+                "created_at": now, "sent_at": now if wa_res["status"] == "sent" else None,
+            })
+
+    mode = "delivered" if _email_configured() else "drafted (simulated)"
+    src_label = "Apollo" if lead_source == "apollo" else "AI"
     await db.activity.insert_one({
         "_id": str(uuid.uuid4()), "user_id": user_id, "type": source,
-        "message": f"Outreach run: {created_leads} leads discovered, {created_emails} cold emails sent.",
+        "message": (f"Outreach run: {created_leads} {src_label} leads, {created_emails} cold emails "
+                    f"{mode}, follow-ups scheduled."),
         "created_at": now,
     })
-    return {"leads": created_leads, "emails": created_emails, "run_at": now}
+    return {"leads": created_leads, "emails": created_emails, "run_at": now,
+            "real_sent": real_sent, "whatsapp_sent": wa_sent, "lead_source": lead_source,
+            "email_live": _email_configured()}
+
+
+async def process_due_followups(user_id: str = None) -> int:
+    now = datetime.now(timezone.utc).isoformat()
+    q = {"type": "follow_up", "status": "scheduled", "scheduled_for": {"$lte": now}}
+    if user_id:
+        q["user_id"] = user_id
+    sent = 0
+    async for fu in db.emails.find(q):
+        lead = await db.leads.find_one({"_id": fu.get("lead_id")})
+        if lead and lead.get("replied"):
+            await db.emails.update_one({"_id": fu["_id"]}, {"$set": {"status": "cancelled"}})
+            continue
+        result = await send_email(fu.get("to_email", ""), fu.get("subject", ""),
+                                  fu.get("body", ""), allow=fu.get("deliverable", False))
+        await db.emails.update_one({"_id": fu["_id"]}, {"$set": {
+            "status": result["status"], "simulated": result.get("simulated", False),
+            "error": result.get("error"), "sent_at": now if result["status"] == "sent" else None,
+        }})
+        if result["status"] == "sent":
+            sent += 1
+    if sent:
+        await db.activity.insert_one({
+            "_id": str(uuid.uuid4()), "user_id": user_id or "system", "type": "auto",
+            "message": f"{sent} scheduled follow-up email(s) sent to non-responders.",
+            "created_at": now,
+        })
+    return sent
 
 
 async def get_or_create_settings(user_id: str) -> dict:
@@ -490,13 +598,30 @@ async def dashboard_stats(user: dict = Depends(get_current_user)):
         volume.append({"day": day[5:], "emails": cnt})
 
     settings = await get_or_create_settings(uid)
+    followups_queued = await db.emails.count_documents(
+        {"user_id": uid, "type": "follow_up", "status": "scheduled"})
+    replied = await db.leads.count_documents({"user_id": uid, "replied": True})
     return {
         "total_leads": total_leads, "emails_sent": emails_sent,
         "whatsapp_ready": wa_ready, "leads_with_phone": leads_with_phone,
         "daily_target": settings.get("daily_target", 100),
         "auto_enabled": settings.get("auto_enabled", True),
+        "followups_queued": followups_queued, "replied": replied,
         "volume": volume,
+        "integrations": integrations_status(),
     }
+
+@api_router.get("/integrations/status")
+async def integrations(user: dict = Depends(get_current_user)):
+    return integrations_status()
+
+@api_router.post("/integrations/test-email")
+async def test_email(user: dict = Depends(get_current_user)):
+    result = await send_email(user["email"],
+                              "OutreachPilot — test email ✅",
+                              f"Hi {user.get('name','there')},\n\nYour SMTP email delivery is working. "
+                              f"OutreachPilot can now send cold emails from your account.\n\n— OutreachPilot")
+    return result
 
 @api_router.post("/automation/run")
 async def run_now(data: RunInput, user: dict = Depends(get_current_user)):
@@ -530,6 +655,22 @@ async def list_activity(user: dict = Depends(get_current_user)):
         a["id"] = a.pop("_id")
     return acts
 
+@api_router.post("/leads/{lead_id}/replied")
+async def mark_replied(lead_id: str, user: dict = Depends(get_current_user)):
+    res = await db.leads.update_one({"_id": lead_id, "user_id": user["id"]},
+                                    {"$set": {"replied": True}})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    cancelled = await db.emails.update_many(
+        {"lead_id": lead_id, "type": "follow_up", "status": "scheduled"},
+        {"$set": {"status": "cancelled"}})
+    return {"replied": True, "cancelled_followups": cancelled.modified_count}
+
+@api_router.post("/followups/process")
+async def followups_process(user: dict = Depends(get_current_user)):
+    sent = await process_due_followups(user["id"])
+    return {"sent": sent}
+
 @api_router.get("/settings")
 async def get_settings(user: dict = Depends(get_current_user)):
     return await get_or_create_settings(user["id"])
@@ -549,6 +690,11 @@ async def scheduler_loop():
     while True:
         try:
             today = datetime.now(timezone.utc).date().isoformat()
+            # Send any follow-ups that are now due
+            try:
+                await process_due_followups()
+            except Exception as e:
+                logger.error(f"Follow-up processing error: {e}")
             async for s in db.settings.find({"auto_enabled": True}):
                 uid = s.get("user_id")
                 last = s.get("last_run") or ""
