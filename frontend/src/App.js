@@ -11,6 +11,7 @@ import Leads from "@/pages/Leads";
 import Outbox from "@/pages/Outbox";
 import Automation from "@/pages/Automation";
 import Activity from "@/pages/Activity";
+import Profile from "@/pages/Profile";
 
 function Protected({ children }) {
   const { user } = useAuth();
@@ -49,6 +50,7 @@ function App() {
               }
             >
               <Route index element={<Dashboard />} />
+              <Route path="profile" element={<Profile />} />
               <Route path="leads" element={<Leads />} />
               <Route path="outbox" element={<Outbox />} />
               <Route path="automation" element={<Automation />} />

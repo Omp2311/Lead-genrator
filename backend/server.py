@@ -149,6 +149,14 @@ class SettingsInput(BaseModel):
     offer: str = "Custom AI-powered software & full-stack development services"
     sender_name: str = "Alex"
     tone: str = "confident and concise"
+    skills: List[str] = ["Python", "Django", "FastAPI", "React", "Node.js", "Generative AI"]
+    headline: str = "Full-stack & GenAI engineer building custom software for growing companies"
+    experience: str = "5+ years shipping full-stack and AI products for startups and enterprises"
+
+class EmailUpdate(BaseModel):
+    to_email: Optional[str] = None
+    subject: Optional[str] = None
+    body: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -172,16 +180,21 @@ async def llm_call(system: str, prompt: str) -> str:
 async def generate_leads(settings: dict, count: int, region=None, industry=None):
     regions = [region] if region else settings.get("regions", ["Dubai, UAE", "USA"])
     industries = [industry] if industry else settings.get("industries", ["SaaS", "IT Services"])
+    skills = settings.get("skills", ["Python", "React", "GenAI"])
     system = ("You are a B2B sales research assistant that produces realistic, plausible "
               "prospect company profiles for a cold outreach demo. Output ONLY valid JSON.")
-    prompt = f"""Generate {count} realistic B2B prospect leads for a cold-outreach demo.
+    prompt = f"""Generate {count} realistic B2B prospect leads for a freelancer/agency doing cold outreach.
+The sender's skills: {', '.join(skills)}. Offer: {settings.get('offer','custom software')}.
 Target regions: {', '.join(regions)}. Target industries: {', '.join(industries)}.
 Focus on high-IT-density cities (Dubai, Silicon Valley, New York, Austin, London).
-Each lead is a decision maker (Founder/CTO/Head of Growth) at a plausible company.
+Each lead is a decision maker (Founder/CTO/Head of Growth) at a plausible company that would
+plausibly NEED the sender's skills.
 Return a JSON array. Each item MUST have keys:
 "company", "contact_name", "title", "email" (plausible corporate email),
 "phone" (E.164 with country code, or empty string for ~30% of them),
-"location", "industry", "website", "pain_point" (1 short sentence specific to them).
+"location", "industry", "website", "pain_point" (1 short sentence specific to them),
+"project_idea" (1 sentence: a concrete project the sender could build for them using their skills),
+"estimated_value" (a realistic project budget range in USD, e.g. "$4k–$8k").
 Return ONLY the JSON array, no prose."""
     raw = await llm_call(system, prompt)
     return _extract_json(raw)
@@ -194,11 +207,13 @@ async def generate_emails(settings: dict, leads: List[dict]):
     tone = settings.get("tone", "confident and concise")
     compact = [{"i": idx, "company": l.get("company"), "contact_name": l.get("contact_name"),
                 "title": l.get("title"), "pain_point": l.get("pain_point"),
-                "industry": l.get("industry")} for idx, l in enumerate(leads)]
+                "project_idea": l.get("project_idea"), "industry": l.get("industry")}
+               for idx, l in enumerate(leads)]
     prompt = f"""Write a personalized cold email for each prospect below.
 Sender name: {sender}. Offer: {offer}. Tone: {tone}.
 Rules: <=120 words, one clear CTA (a 15-min call), reference their pain_point naturally,
-no fluff, no "I hope this finds you well". Subject line <=6 words, curiosity-driven.
+and pitch the specific "project_idea" as what you could build for them. No fluff, no
+"I hope this finds you well". Subject line <=6 words, curiosity-driven.
 Prospects: {json.dumps(compact)}
 Return a JSON array where each item has: "i" (matching index), "subject", "body".
 Body should use \\n for line breaks and end with "{sender}". Return ONLY JSON."""
@@ -414,7 +429,10 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
             "contact_name": lead.get("contact_name", ""), "title": lead.get("title", ""),
             "email": lead.get("email", ""), "phone": phone, "location": lead.get("location", ""),
             "industry": lead.get("industry", ""), "website": lead.get("website", ""),
-            "pain_point": lead.get("pain_point", ""), "whatsapp_link": wa,
+            "pain_point": lead.get("pain_point", ""),
+            "project_idea": lead.get("project_idea", ""),
+            "estimated_value": lead.get("estimated_value", ""),
+            "whatsapp_link": wa,
             "created_at": now, "source": source, "lead_source": lead_source, "replied": False,
         })
         created_leads += 1
@@ -423,19 +441,16 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
         subject = em.get("subject", "Quick question")
         body = em.get("body", "")
         to_email = lead.get("email", "")
-        result = await send_email(to_email, subject, body, allow=deliver) if to_email else \
-            {"status": "failed", "simulated": False, "provider_id": None, "error": "no email"}
-        if result["status"] == "sent" and not result.get("simulated"):
-            real_sent += 1
+        # Emails are created as editable DRAFTS — user sends them from the Outbox.
         await db.emails.insert_one({
             "_id": str(uuid.uuid4()), "user_id": user_id, "lead_id": lead_id,
             "company": lead.get("company", ""), "contact_name": lead.get("contact_name", ""),
             "to_email": to_email, "subject": subject, "body": body,
             "channel": "email", "step": 1, "type": "initial",
-            "status": result["status"], "simulated": result.get("simulated", False),
-            "error": result.get("error"), "created_at": now,
+            "status": "draft", "simulated": False,
+            "error": None, "created_at": now,
             "deliverable": deliver, "lead_source": lead_source,
-            "sent_at": now if result["status"] == "sent" else None,
+            "sent_at": None,
         })
         created_emails += 1
 
@@ -472,12 +487,12 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
                 "created_at": now, "sent_at": now if wa_res["status"] == "sent" else None,
             })
 
-    mode = "delivered" if _email_configured() else "drafted (simulated)"
     src_label = "Apollo" if lead_source == "apollo" else "AI"
     await db.activity.insert_one({
         "_id": str(uuid.uuid4()), "user_id": user_id, "type": source,
-        "message": (f"Outreach run: {created_leads} {src_label} leads, {created_emails} cold emails "
-                    f"{mode}, follow-ups scheduled."),
+        "message": (f"Outreach run: {created_leads} {src_label} leads discovered, "
+                    f"{created_emails} personalized emails drafted (ready to send), "
+                    f"follow-ups scheduled."),
         "created_at": now,
     })
     return {"leads": created_leads, "emails": created_emails, "run_at": now,
@@ -590,6 +605,7 @@ async def dashboard_stats(user: dict = Depends(get_current_user)):
     uid = user["id"]
     total_leads = await db.leads.count_documents({"user_id": uid})
     emails_sent = await db.emails.count_documents({"user_id": uid, "channel": "email", "status": "sent"})
+    drafts = await db.emails.count_documents({"user_id": uid, "channel": "email", "status": {"$in": ["draft", "failed"]}})
     wa_ready = await db.emails.count_documents({"user_id": uid, "channel": "whatsapp"})
     leads_with_phone = await db.leads.count_documents({"user_id": uid, "phone": {"$ne": ""}})
 
@@ -613,6 +629,7 @@ async def dashboard_stats(user: dict = Depends(get_current_user)):
         "daily_target": settings.get("daily_target", 100),
         "auto_enabled": settings.get("auto_enabled", True),
         "followups_queued": followups_queued, "replied": replied,
+        "drafts": drafts,
         "volume": volume,
         "integrations": integrations_status(),
     }
@@ -660,6 +677,69 @@ async def list_activity(user: dict = Depends(get_current_user)):
     for a in acts:
         a["id"] = a.pop("_id")
     return acts
+
+@api_router.put("/emails/{email_id}")
+async def edit_email(email_id: str, data: EmailUpdate, user: dict = Depends(get_current_user)):
+    em = await db.emails.find_one({"_id": email_id, "user_id": user["id"]})
+    if not em:
+        raise HTTPException(status_code=404, detail="Email not found")
+    if em.get("status") == "sent":
+        raise HTTPException(status_code=400, detail="Email already sent")
+    upd = {k: v for k, v in data.model_dump().items() if v is not None}
+    if upd:
+        await db.emails.update_one({"_id": email_id}, {"$set": upd})
+    doc = await db.emails.find_one({"_id": email_id})
+    doc["id"] = doc.pop("_id")
+    return doc
+
+async def _send_one_email(em: dict) -> dict:
+    """Manual send always attempts real delivery to the address shown."""
+    to_email = (em.get("to_email") or "").strip()
+    if not to_email:
+        return {"status": "failed", "error": "No recipient", "simulated": False}
+    result = await send_email(to_email, em.get("subject", ""), em.get("body", ""), allow=True)
+    now = datetime.now(timezone.utc).isoformat()
+    await db.emails.update_one({"_id": em["_id"]}, {"$set": {
+        "status": result["status"], "simulated": result.get("simulated", False),
+        "error": result.get("error"), "sent_at": now if result["status"] == "sent" else None,
+    }})
+    return result
+
+@api_router.post("/emails/{email_id}/send")
+async def send_one(email_id: str, user: dict = Depends(get_current_user)):
+    em = await db.emails.find_one({"_id": email_id, "user_id": user["id"]})
+    if not em:
+        raise HTTPException(status_code=404, detail="Email not found")
+    if em.get("status") == "sent":
+        return {"status": "sent", "already": True}
+    result = await _send_one_email(em)
+    await db.activity.insert_one({
+        "_id": str(uuid.uuid4()), "user_id": user["id"], "type": "manual",
+        "message": (f"Email to {em.get('contact_name','')} ({em.get('company','')}) "
+                    f"{'sent' if result['status']=='sent' else 'failed to send'}."),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return result
+
+@api_router.post("/emails/send-all")
+async def send_all(user: dict = Depends(get_current_user)):
+    drafts = await db.emails.find(
+        {"user_id": user["id"], "channel": "email", "type": "initial",
+         "status": {"$in": ["draft", "failed"]}}).to_list(1000)
+    sent = 0
+    failed = 0
+    for em in drafts:
+        result = await _send_one_email(em)
+        if result["status"] == "sent":
+            sent += 1
+        else:
+            failed += 1
+    await db.activity.insert_one({
+        "_id": str(uuid.uuid4()), "user_id": user["id"], "type": "manual",
+        "message": f"Send all: {sent} email(s) sent, {failed} failed.",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return {"sent": sent, "failed": failed}
 
 @api_router.post("/leads/{lead_id}/replied")
 async def mark_replied(lead_id: str, user: dict = Depends(get_current_user)):

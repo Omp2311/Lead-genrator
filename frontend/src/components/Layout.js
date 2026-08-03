@@ -8,10 +8,12 @@ import {
   Activity as ActivityIcon,
   LogOut,
   Radar,
+  UserCog,
 } from "lucide-react";
 
 const nav = [
   { to: "/", label: "Command", icon: LayoutDashboard, end: true, id: "nav-dashboard" },
+  { to: "/profile", label: "Profile & Skills", icon: UserCog, id: "nav-profile" },
   { to: "/leads", label: "Leads", icon: Users, id: "nav-leads" },
   { to: "/outbox", label: "Outbox", icon: Send, id: "nav-outbox" },
   { to: "/automation", label: "Automation", icon: Zap, id: "nav-automation" },

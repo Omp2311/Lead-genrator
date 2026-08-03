@@ -1,0 +1,39 @@
+{
+  "summary": "Full-stack testing of OutreachPilot iteration 2 (Profile & Skills, Draft-based email flow, real SMTP send, Apollo blocked/graceful fallback). Backend pytest: 12/13 passed. Frontend: Profile save+persistence, Leads project_idea/estimated_value + Mark-replied, Outbox drafts with Send/Edit/Send-all, Dashboard new stats (Follow-ups queued, Replied) + integrations panel (Email·SMTP LIVE, Leads·Apollo OFF, WhatsApp·Twilio OFF) all working. Real SMTP send to omprakashraj100078@gmail.com returned status='sent', simulated=false via provider 'smtp'. Automation run creates initial emails as 'draft' (verified) and schedules follow-ups (verified).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "GET /api/settings", "issue": "For existing users whose settings doc was created BEFORE new fields (skills/headline/experience) were added to the SettingsInput schema, GET returns the stored doc without merging in Pydantic defaults, so those fields are missing. Impact: Profile page shows empty skills/headline/experience for pre-existing accounts until user hits Save once. Fix: in get_or_create_settings, merge {**SettingsInput().model_dump(), **stored_doc} so new schema fields backfill."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_outreachpilot_api.py",
+    "/app/backend/tests/conftest.py",
+    "/app/test_reports/pytest/iter2_results.xml"
+  ],
+  "action_items": [
+    "MINOR: Merge SettingsInput() defaults over stored doc in get_or_create_settings so existing users automatically get new schema fields (skills/headline/experience) without needing to click Save first."
+  ],
+  "critical_code_review_comments": [
+    "SMTP send verified real via provider 'smtp' (simulated=false). PUT /api/emails/{id} correctly rejects edits on 'sent' emails (400). Send-all only picks draft/failed initials (correct scope, won't re-send scheduled follow-ups).",
+    "integrations_status() correctly flips leads_live→false and leads_blocked→true after Apollo 403 (verified by test).",
+    "execute_run() writes initial emails with status='draft' and follow-ups with status='scheduled' + scheduled_for +3d/+6d — matches spec.",
+    "Leads endpoint returns project_idea + estimated_value; frontend Leads.js renders lead-project-{i} block with estimated_value badge — verified.",
+    "Login.js no longer prefills admin creds — good security fix vs iteration_1.",
+    "Password on /api/auth/login is not rate-limited (still same observation as iter1) — not a blocker."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_outreachpilot_api.py"
+  ],
+  "success_rate": {"backend": "92% (12/13)", "frontend": "100%"},
+  "test_credentials": "admin@outreachpilot.com / admin123 (working). Safe SMTP recipient: omprakashraj100078@gmail.com (real delivery confirmed via /api/emails/{id}/send, status='sent', simulated=false).",
+  "seed_data_creation": "Backend tests + one manual UI run created ~5 new leads (with project_idea/estimated_value) + drafts + scheduled follow-ups. Backend test flow retargeted drafts to omprakashraj100078@gmail.com before real SMTP send + send-all. Total DB now has 34 leads / 34 emails sent / 34 follow-ups queued / 1 replied.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend tests at /app/backend/tests/test_outreachpilot_api.py run in ~25-30s (one real LLM automation run with count=3, plus real SMTP send). The single failing test (TestProfileSettings.test_settings_defaults_include_new_fields) fails only because admin's settings doc predates the schema addition; fix backend get_or_create_settings to merge defaults and the test will pass without change. Login page inputs have no data-testid — locate via input[type=email/password] + button by name 'Enter dashboard'. Post-login URL is '/' (not '/dashboard')."
+}

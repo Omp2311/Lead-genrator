@@ -85,6 +85,20 @@ export default function Leads() {
                 <span className="text-cyan-400/80">Signal:</span> {l.pain_point}
               </p>
 
+              {l.project_idea && (
+                <div className="mt-3 bg-cyan-400/5 border border-cyan-500/20 rounded-sm p-2.5" data-testid={`lead-project-${i}`}>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[10px] uppercase tracking-wider text-cyan-400/90">Project idea</span>
+                    {l.estimated_value && (
+                      <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded-sm">
+                        {l.estimated_value}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-zinc-300 leading-relaxed">{l.project_idea}</p>
+                </div>
+              )}
+
               {l.replied ? (
                 <div className="mt-3 flex items-center gap-2 text-xs text-emerald-400" data-testid={`lead-replied-${i}`}>
                   <CheckCircle2 className="w-4 h-4" /> Replied — follow-ups stopped

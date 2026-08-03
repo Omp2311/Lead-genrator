@@ -65,7 +65,7 @@ export default function Dashboard() {
     toast.info("Agent deployed — discovering leads & drafting emails…");
     try {
       const res = await api.post("/automation/run", { count: 8 });
-      toast.success(`${res.data.leads} leads found · ${res.data.emails} emails sent`);
+      toast.success(`${res.data.leads} leads found · ${res.data.emails} emails drafted — review in Outbox`);
       await load();
     } catch (e) {
       toast.error("Run failed. Check your LLM key balance and try again.");
