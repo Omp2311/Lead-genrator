@@ -10,31 +10,46 @@ import uuid
 import json
 import secrets
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from typing import List, Optional
 from urllib.parse import quote
 
 import bcrypt
 import jwt
-from bson import ObjectId
+import asyncpg
 from fastapi import FastAPI, APIRouter, Request, Response, HTTPException, Depends
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr
 
 import httpx
 import smtplib
 from email.message import EmailMessage
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+from anthropic import AsyncAnthropic
+from openai import AsyncOpenAI
 
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+DATABASE_URL = os.environ['DATABASE_URL']
+pool: asyncpg.Pool = None  # set on startup
 
-EMERGENT_LLM_KEY = os.environ['EMERGENT_LLM_KEY']
+async def _init_connection(conn):
+    # Treat uuid columns as plain strings everywhere (no uuid.UUID juggling in route code).
+    await conn.set_type_codec('uuid', encoder=str, decoder=str, schema='pg_catalog', format='text')
+
+def rec(r):
+    return dict(r) if r is not None else None
+
+def recs(rows):
+    return [dict(r) for r in rows]
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic").strip().lower()
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929").strip()
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
+anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 JWT_SECRET = os.environ['JWT_SECRET']
 JWT_ALGORITHM = "HS256"
 
@@ -113,10 +128,9 @@ async def get_current_user(request: Request) -> dict:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "access":
             raise HTTPException(status_code=401, detail="Invalid token type")
-        user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
+        user = rec(await pool.fetchrow("SELECT * FROM users WHERE id=$1", payload["sub"]))
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
-        user["id"] = str(user.pop("_id"))
         user.pop("password_hash", None)
         return user
     except jwt.ExpiredSignatureError:
@@ -175,10 +189,36 @@ def _extract_json(text: str):
     start = min([i for i in [text.find("["), text.find("{")] if i != -1], default=0)
     return json.loads(text[start:])
 
+async def _call_anthropic(system: str, prompt: str) -> str:
+    resp = await anthropic_client.messages.create(
+        model=ANTHROPIC_MODEL, max_tokens=4096, system=system,
+        messages=[{"role": "user", "content": prompt}])
+    return "".join(b.text for b in resp.content if b.type == "text")
+
+async def _call_openai(system: str, prompt: str) -> str:
+    resp = await openai_client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}])
+    return resp.choices[0].message.content
+
 async def llm_call(system: str, prompt: str) -> str:
-    chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=f"op-{uuid.uuid4()}",
-                   system_message=system).with_model("openai", "gpt-5.4")
-    return await chat.send_message(UserMessage(text=prompt))
+    providers = [LLM_PROVIDER] + [p for p in ("anthropic", "openai") if p != LLM_PROVIDER]
+    last_err = None
+    for provider in providers:
+        if provider == "anthropic" and anthropic_client:
+            try:
+                return await _call_anthropic(system, prompt)
+            except Exception as e:
+                logger.error(f"Anthropic call failed: {e}")
+                last_err = e
+        elif provider == "openai" and openai_client:
+            try:
+                return await _call_openai(system, prompt)
+            except Exception as e:
+                logger.error(f"OpenAI call failed: {e}")
+                last_err = e
+    raise RuntimeError(f"No LLM provider available/working (set ANTHROPIC_API_KEY and/or "
+                       f"OPENAI_API_KEY in backend/.env). Last error: {last_err}")
 
 async def generate_leads(settings: dict, count: int, region=None, industry=None):
     regions = [region] if region else settings.get("regions", ["Dubai, UAE", "USA"])
@@ -415,7 +455,6 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
         fups_by_i = {}
 
     now_dt = datetime.now(timezone.utc)
-    now = now_dt.isoformat()
     sender = settings.get("sender_name", "Alex")
     created_emails = 0
     created_leads = 0
@@ -427,17 +466,16 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
         phone = (lead.get("phone") or "").strip()
         wa = whatsapp_link(phone, lead.get("company", ""), sender,
                            settings.get("offer", "")) if phone else None
-        await db.leads.insert_one({
-            "_id": lead_id, "user_id": user_id, "company": lead.get("company", ""),
-            "contact_name": lead.get("contact_name", ""), "title": lead.get("title", ""),
-            "email": lead.get("email", ""), "phone": phone, "location": lead.get("location", ""),
-            "industry": lead.get("industry", ""), "website": lead.get("website", ""),
-            "pain_point": lead.get("pain_point", ""),
-            "project_idea": lead.get("project_idea", ""),
-            "estimated_value": lead.get("estimated_value", ""),
-            "whatsapp_link": wa,
-            "created_at": now, "source": source, "lead_source": lead_source, "replied": False,
-        })
+        await pool.execute("""
+            INSERT INTO leads (id, user_id, company, contact_name, title, email, phone, location,
+                                industry, website, pain_point, project_idea, estimated_value,
+                                whatsapp_link, created_at, source, lead_source, replied)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,false)
+        """, lead_id, user_id, lead.get("company", ""), lead.get("contact_name", ""),
+             lead.get("title", ""), lead.get("email", ""), phone, lead.get("location", ""),
+             lead.get("industry", ""), lead.get("website", ""), lead.get("pain_point", ""),
+             lead.get("project_idea", ""), lead.get("estimated_value", ""), wa, now_dt,
+             source, lead_source)
         created_leads += 1
 
         em = email_by_i.get(idx, {})
@@ -445,32 +483,27 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
         body = em.get("body", "")
         to_email = lead.get("email", "")
         # Emails are created as editable DRAFTS — user sends them from the Outbox.
-        await db.emails.insert_one({
-            "_id": str(uuid.uuid4()), "user_id": user_id, "lead_id": lead_id,
-            "company": lead.get("company", ""), "contact_name": lead.get("contact_name", ""),
-            "to_email": to_email, "subject": subject, "body": body,
-            "channel": "email", "step": 1, "type": "initial",
-            "status": "draft", "simulated": False,
-            "error": None, "created_at": now,
-            "deliverable": deliver, "lead_source": lead_source,
-            "sent_at": None,
-        })
+        await pool.execute("""
+            INSERT INTO emails (id, user_id, lead_id, company, contact_name, to_email, subject, body,
+                                 channel, step, type, status, simulated, error, created_at,
+                                 deliverable, lead_source, sent_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'email',1,'initial','draft',false,NULL,$9,$10,$11,NULL)
+        """, str(uuid.uuid4()), user_id, lead_id, lead.get("company", ""),
+             lead.get("contact_name", ""), to_email, subject, body, now_dt, deliver, lead_source)
         created_emails += 1
 
         # Schedule follow-ups (sent later if the lead hasn't replied)
         for step_i, fu in enumerate(fups_by_i.get(idx, [])[:2]):
             delay = FOLLOWUP_DELAYS_DAYS[step_i] if step_i < len(FOLLOWUP_DELAYS_DAYS) else 6
-            scheduled_for = (now_dt + timedelta(days=delay)).isoformat()
-            await db.emails.insert_one({
-                "_id": str(uuid.uuid4()), "user_id": user_id, "lead_id": lead_id,
-                "company": lead.get("company", ""), "contact_name": lead.get("contact_name", ""),
-                "to_email": to_email, "subject": fu.get("subject", "Re: quick follow-up"),
-                "body": fu.get("body", ""), "channel": "email", "step": step_i + 2,
-                "type": "follow_up", "status": "scheduled", "simulated": False,
-                "error": None, "created_at": now, "sent_at": None,
-                "deliverable": deliver, "lead_source": lead_source,
-                "scheduled_for": scheduled_for,
-            })
+            scheduled_for = now_dt + timedelta(days=delay)
+            await pool.execute("""
+                INSERT INTO emails (id, user_id, lead_id, company, contact_name, to_email, subject, body,
+                                     channel, step, type, status, simulated, error, created_at, sent_at,
+                                     deliverable, lead_source, scheduled_for)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'email',$9,'follow_up','scheduled',false,NULL,$10,NULL,$11,$12,$13)
+            """, str(uuid.uuid4()), user_id, lead_id, lead.get("company", ""),
+                 lead.get("contact_name", ""), to_email, fu.get("subject", "Re: quick follow-up"),
+                 fu.get("body", ""), step_i + 2, now_dt, deliver, lead_source, scheduled_for)
 
         # WhatsApp proposal
         if wa:
@@ -480,54 +513,58 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
             wa_res = await send_whatsapp(phone, wa_body, allow=(lead_source == "apollo"))
             if wa_res["status"] == "sent" and not wa_res.get("simulated"):
                 wa_sent += 1
-            await db.emails.insert_one({
-                "_id": str(uuid.uuid4()), "user_id": user_id, "lead_id": lead_id,
-                "company": lead.get("company", ""), "contact_name": lead.get("contact_name", ""),
-                "to_email": phone, "subject": "WhatsApp proposal", "body": wa_body,
-                "channel": "whatsapp", "step": 1, "type": "initial",
-                "status": wa_res["status"], "simulated": wa_res.get("simulated", False),
-                "error": wa_res.get("error"), "whatsapp_link": wa,
-                "created_at": now, "sent_at": now if wa_res["status"] == "sent" else None,
-            })
+            await pool.execute("""
+                INSERT INTO emails (id, user_id, lead_id, company, contact_name, to_email, subject, body,
+                                     channel, step, type, status, simulated, error, whatsapp_link,
+                                     created_at, sent_at)
+                VALUES ($1,$2,$3,$4,$5,$6,'WhatsApp proposal',$7,'whatsapp',1,'initial',$8,$9,$10,$11,$12,$13)
+            """, str(uuid.uuid4()), user_id, lead_id, lead.get("company", ""),
+                 lead.get("contact_name", ""), phone, wa_body, wa_res["status"],
+                 wa_res.get("simulated", False), wa_res.get("error"), wa, now_dt,
+                 now_dt if wa_res["status"] == "sent" else None)
 
     src_label = "Apollo" if lead_source == "apollo" else "AI"
-    await db.activity.insert_one({
-        "_id": str(uuid.uuid4()), "user_id": user_id, "type": source,
-        "message": (f"Outreach run: {created_leads} {src_label} leads discovered, "
-                    f"{created_emails} personalized emails drafted (ready to send), "
-                    f"follow-ups scheduled."),
-        "created_at": now,
-    })
-    return {"leads": created_leads, "emails": created_emails, "run_at": now,
+    await pool.execute("""
+        INSERT INTO activity (id, user_id, type, message, created_at)
+        VALUES ($1,$2,$3,$4,$5)
+    """, str(uuid.uuid4()), user_id, source,
+         (f"Outreach run: {created_leads} {src_label} leads discovered, "
+          f"{created_emails} personalized emails drafted (ready to send), "
+          f"follow-ups scheduled."), now_dt)
+    return {"leads": created_leads, "emails": created_emails, "run_at": now_dt.isoformat(),
             "real_sent": real_sent, "whatsapp_sent": wa_sent, "lead_source": lead_source,
             "email_live": _email_configured()}
 
 
 async def process_due_followups(user_id: str = None) -> int:
-    now = datetime.now(timezone.utc).isoformat()
-    q = {"type": "follow_up", "status": "scheduled", "scheduled_for": {"$lte": now}}
+    now = datetime.now(timezone.utc)
     if user_id:
-        q["user_id"] = user_id
+        due = recs(await pool.fetch(
+            "SELECT * FROM emails WHERE type='follow_up' AND status='scheduled' "
+            "AND scheduled_for<=$1 AND user_id=$2", now, user_id))
+    else:
+        due = recs(await pool.fetch(
+            "SELECT * FROM emails WHERE type='follow_up' AND status='scheduled' "
+            "AND scheduled_for<=$1", now))
     sent = 0
-    async for fu in db.emails.find(q):
-        lead = await db.leads.find_one({"_id": fu.get("lead_id")})
+    for fu in due:
+        lead = rec(await pool.fetchrow("SELECT * FROM leads WHERE id=$1", fu.get("lead_id")))
         if lead and lead.get("replied"):
-            await db.emails.update_one({"_id": fu["_id"]}, {"$set": {"status": "cancelled"}})
+            await pool.execute("UPDATE emails SET status='cancelled' WHERE id=$1", fu["id"])
             continue
         result = await send_email(fu.get("to_email", ""), fu.get("subject", ""),
                                   fu.get("body", ""), allow=fu.get("deliverable", False))
-        await db.emails.update_one({"_id": fu["_id"]}, {"$set": {
-            "status": result["status"], "simulated": result.get("simulated", False),
-            "error": result.get("error"), "sent_at": now if result["status"] == "sent" else None,
-        }})
+        await pool.execute(
+            "UPDATE emails SET status=$1, simulated=$2, error=$3, sent_at=$4 WHERE id=$5",
+            result["status"], result.get("simulated", False), result.get("error"),
+            now if result["status"] == "sent" else None, fu["id"])
         if result["status"] == "sent":
             sent += 1
     if sent:
-        await db.activity.insert_one({
-            "_id": str(uuid.uuid4()), "user_id": user_id or "system", "type": "auto",
-            "message": f"{sent} scheduled follow-up email(s) sent to non-responders.",
-            "created_at": now,
-        })
+        await pool.execute("""
+            INSERT INTO activity (id, user_id, type, message, created_at)
+            VALUES ($1,$2,'auto',$3,$4)
+        """, str(uuid.uuid4()), user_id, f"{sent} scheduled follow-up email(s) sent to non-responders.", now)
     return sent
 
 
@@ -566,36 +603,45 @@ async def scan_replies(user_id: str = None) -> dict:
     except Exception as e:
         logger.error(f"IMAP reply scan failed: {e}")
         return {"matched": 0, "error": str(e)}
-    q = {"replied": False, "email": {"$ne": ""}}
     if user_id:
-        q["user_id"] = user_id
+        candidates = recs(await pool.fetch(
+            "SELECT * FROM leads WHERE replied=false AND email != '' AND user_id=$1", user_id))
+    else:
+        candidates = recs(await pool.fetch(
+            "SELECT * FROM leads WHERE replied=false AND email != ''"))
     matched = 0
-    async for lead in db.leads.find(q):
+    for lead in candidates:
         if (lead.get("email") or "").lower() in senders:
-            await db.leads.update_one({"_id": lead["_id"]}, {"$set": {"replied": True}})
-            await db.emails.update_many(
-                {"lead_id": lead["_id"], "type": "follow_up", "status": "scheduled"},
-                {"$set": {"status": "cancelled"}})
-            await db.activity.insert_one({
-                "_id": str(uuid.uuid4()), "user_id": lead.get("user_id"), "type": "auto",
-                "message": (f"Reply detected from {lead.get('contact_name','')} "
-                            f"({lead.get('company','')}) — follow-ups auto-stopped."),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            })
+            await pool.execute("UPDATE leads SET replied=true WHERE id=$1", lead["id"])
+            await pool.execute(
+                "UPDATE emails SET status='cancelled' WHERE lead_id=$1 AND type='follow_up' AND status='scheduled'",
+                lead["id"])
+            await pool.execute("""
+                INSERT INTO activity (id, user_id, type, message, created_at)
+                VALUES ($1,$2,'auto',$3,$4)
+            """, str(uuid.uuid4()), lead.get("user_id"),
+                 (f"Reply detected from {lead.get('contact_name','')} "
+                  f"({lead.get('company','')}) — follow-ups auto-stopped."),
+                 datetime.now(timezone.utc))
             matched += 1
     return {"matched": matched}
 
 
-
 async def get_or_create_settings(user_id: str) -> dict:
-    s = await db.settings.find_one({"user_id": user_id}, {"_id": 0})
+    s = rec(await pool.fetchrow("SELECT * FROM settings WHERE user_id=$1", user_id))
     if not s:
-        default = SettingsInput().model_dump()
-        default["user_id"] = user_id
-        default["last_run"] = None
-        await db.settings.insert_one({**default, "_id": str(uuid.uuid4())})
-        return default
-    # Backfill any new schema fields for docs created before they existed
+        d = SettingsInput().model_dump()
+        await pool.execute("""
+            INSERT INTO settings (user_id, daily_target, auto_enabled, regions, industries, offer,
+                                   sender_name, tone, skills, headline, experience)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            ON CONFLICT (user_id) DO NOTHING
+        """, user_id, d["daily_target"], d["auto_enabled"], d["regions"], d["industries"],
+             d["offer"], d["sender_name"], d["tone"], d["skills"], d["headline"], d["experience"])
+        d["user_id"] = user_id
+        d["last_run"] = None
+        return d
+    # Backfill any new schema fields for rows created before they existed
     return {**SettingsInput().model_dump(), **s}
 
 
@@ -605,22 +651,22 @@ async def get_or_create_settings(user_id: str) -> dict:
 @api_router.post("/auth/register")
 async def register(data: RegisterInput, response: Response):
     email = data.email.lower()
-    if await db.users.find_one({"email": email}):
+    if await pool.fetchrow("SELECT 1 FROM users WHERE email=$1", email):
         raise HTTPException(status_code=400, detail="Email already registered")
-    doc = {"email": email, "name": data.name, "password_hash": hash_password(data.password),
-           "role": "user", "created_at": datetime.now(timezone.utc).isoformat()}
-    res = await db.users.insert_one(doc)
-    uid = str(res.inserted_id)
+    row = await pool.fetchrow("""
+        INSERT INTO users (email, name, password_hash, role) VALUES ($1,$2,$3,'user') RETURNING id
+    """, email, data.name, hash_password(data.password))
+    uid = row["id"]
     set_auth_cookies(response, create_access_token(uid, email), create_refresh_token(uid))
     return {"id": uid, "email": email, "name": data.name, "role": "user"}
 
 @api_router.post("/auth/login")
 async def login(data: LoginInput, response: Response):
     email = data.email.lower()
-    user = await db.users.find_one({"email": email})
+    user = rec(await pool.fetchrow("SELECT * FROM users WHERE email=$1", email))
     if not user or not verify_password(data.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    uid = str(user["_id"])
+    uid = user["id"]
     set_auth_cookies(response, create_access_token(uid, email), create_refresh_token(uid))
     return {"id": uid, "email": email, "name": user.get("name", ""), "role": user.get("role", "user")}
 
@@ -643,10 +689,10 @@ async def refresh(request: Request, response: Response):
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "refresh":
             raise HTTPException(status_code=401, detail="Invalid token type")
-        user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
+        user = rec(await pool.fetchrow("SELECT * FROM users WHERE id=$1", payload["sub"]))
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
-        response.set_cookie("access_token", create_access_token(str(user["_id"]), user["email"]),
+        response.set_cookie("access_token", create_access_token(user["id"], user["email"]),
                             httponly=True, secure=True, samesite="none", max_age=43200, path="/")
         return {"message": "refreshed"}
     except jwt.InvalidTokenError:
@@ -663,26 +709,30 @@ async def root():
 @api_router.get("/dashboard/stats")
 async def dashboard_stats(user: dict = Depends(get_current_user)):
     uid = user["id"]
-    total_leads = await db.leads.count_documents({"user_id": uid})
-    emails_sent = await db.emails.count_documents({"user_id": uid, "channel": "email", "status": "sent"})
-    drafts = await db.emails.count_documents({"user_id": uid, "channel": "email", "status": {"$in": ["draft", "failed"]}})
-    wa_ready = await db.emails.count_documents({"user_id": uid, "channel": "whatsapp"})
-    leads_with_phone = await db.leads.count_documents({"user_id": uid, "phone": {"$ne": ""}})
+    total_leads = await pool.fetchval("SELECT count(*) FROM leads WHERE user_id=$1", uid)
+    emails_sent = await pool.fetchval(
+        "SELECT count(*) FROM emails WHERE user_id=$1 AND channel='email' AND status='sent'", uid)
+    drafts = await pool.fetchval(
+        "SELECT count(*) FROM emails WHERE user_id=$1 AND channel='email' AND status = ANY($2::text[])",
+        uid, ["draft", "failed"])
+    wa_ready = await pool.fetchval(
+        "SELECT count(*) FROM emails WHERE user_id=$1 AND channel='whatsapp'", uid)
+    leads_with_phone = await pool.fetchval(
+        "SELECT count(*) FROM leads WHERE user_id=$1 AND phone != ''", uid)
 
     # last 7 days email volume
     volume = []
     for d in range(6, -1, -1):
-        day = (datetime.now(timezone.utc) - timedelta(days=d)).date().isoformat()
-        cnt = await db.emails.count_documents({
-            "user_id": uid, "channel": "email",
-            "sent_at": {"$gte": day + "T00:00:00", "$lte": day + "T23:59:59.999999"}
-        })
-        volume.append({"day": day[5:], "emails": cnt})
+        day = (datetime.now(timezone.utc) - timedelta(days=d)).date()
+        cnt = await pool.fetchval(
+            "SELECT count(*) FROM emails WHERE user_id=$1 AND channel='email' AND sent_at::date=$2",
+            uid, day)
+        volume.append({"day": day.isoformat()[5:], "emails": cnt})
 
     settings = await get_or_create_settings(uid)
-    followups_queued = await db.emails.count_documents(
-        {"user_id": uid, "type": "follow_up", "status": "scheduled"})
-    replied = await db.leads.count_documents({"user_id": uid, "replied": True})
+    followups_queued = await pool.fetchval(
+        "SELECT count(*) FROM emails WHERE user_id=$1 AND type='follow_up' AND status='scheduled'", uid)
+    replied = await pool.fetchval("SELECT count(*) FROM leads WHERE user_id=$1 AND replied=true", uid)
     return {
         "total_leads": total_leads, "emails_sent": emails_sent,
         "whatsapp_ready": wa_ready, "leads_with_phone": leads_with_phone,
@@ -710,47 +760,43 @@ async def test_email(user: dict = Depends(get_current_user)):
 async def run_now(data: RunInput, user: dict = Depends(get_current_user)):
     count = max(1, min(data.count, 15))
     result = await execute_run(user["id"], count, data.region, data.industry, data.offer, data.tone)
-    await db.settings.update_one({"user_id": user["id"]},
-                                 {"$set": {"last_run": result["run_at"]}})
+    await pool.execute("UPDATE settings SET last_run=$1 WHERE user_id=$2",
+                       datetime.fromisoformat(result["run_at"]), user["id"])
     return result
 
 @api_router.get("/leads")
 async def list_leads(user: dict = Depends(get_current_user)):
-    leads = await db.leads.find({"user_id": user["id"]}).sort("created_at", -1).to_list(500)
-    for l in leads:
-        l["id"] = l.pop("_id")
-    return leads
+    return recs(await pool.fetch(
+        "SELECT * FROM leads WHERE user_id=$1 ORDER BY created_at DESC LIMIT 500", user["id"]))
 
 @api_router.get("/emails")
 async def list_emails(channel: Optional[str] = None, user: dict = Depends(get_current_user)):
-    q = {"user_id": user["id"]}
     if channel:
-        q["channel"] = channel
-    emails = await db.emails.find(q).sort("created_at", -1).to_list(1000)
-    for e in emails:
-        e["id"] = e.pop("_id")
-    return emails
+        rows = await pool.fetch(
+            "SELECT * FROM emails WHERE user_id=$1 AND channel=$2 ORDER BY created_at DESC LIMIT 1000",
+            user["id"], channel)
+    else:
+        rows = await pool.fetch(
+            "SELECT * FROM emails WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1000", user["id"])
+    return recs(rows)
 
 @api_router.get("/activity")
 async def list_activity(user: dict = Depends(get_current_user)):
-    acts = await db.activity.find({"user_id": user["id"]}).sort("created_at", -1).to_list(200)
-    for a in acts:
-        a["id"] = a.pop("_id")
-    return acts
+    return recs(await pool.fetch(
+        "SELECT * FROM activity WHERE user_id=$1 ORDER BY created_at DESC LIMIT 200", user["id"]))
 
 @api_router.put("/emails/{email_id}")
 async def edit_email(email_id: str, data: EmailUpdate, user: dict = Depends(get_current_user)):
-    em = await db.emails.find_one({"_id": email_id, "user_id": user["id"]})
+    em = rec(await pool.fetchrow("SELECT * FROM emails WHERE id=$1 AND user_id=$2", email_id, user["id"]))
     if not em:
         raise HTTPException(status_code=404, detail="Email not found")
     if em.get("status") == "sent":
         raise HTTPException(status_code=400, detail="Email already sent")
     upd = {k: v for k, v in data.model_dump().items() if v is not None}
     if upd:
-        await db.emails.update_one({"_id": email_id}, {"$set": upd})
-    doc = await db.emails.find_one({"_id": email_id})
-    doc["id"] = doc.pop("_id")
-    return doc
+        set_clause = ", ".join(f"{k}=${i + 2}" for i, k in enumerate(upd.keys()))
+        await pool.execute(f"UPDATE emails SET {set_clause} WHERE id=$1", email_id, *upd.values())
+    return rec(await pool.fetchrow("SELECT * FROM emails WHERE id=$1", email_id))
 
 async def _send_one_email(em: dict) -> dict:
     """Manual send always attempts real delivery to the address shown."""
@@ -758,34 +804,36 @@ async def _send_one_email(em: dict) -> dict:
     if not to_email:
         return {"status": "failed", "error": "No recipient", "simulated": False}
     result = await send_email(to_email, em.get("subject", ""), em.get("body", ""), allow=True)
-    now = datetime.now(timezone.utc).isoformat()
-    await db.emails.update_one({"_id": em["_id"]}, {"$set": {
-        "status": result["status"], "simulated": result.get("simulated", False),
-        "error": result.get("error"), "sent_at": now if result["status"] == "sent" else None,
-    }})
+    now = datetime.now(timezone.utc)
+    await pool.execute(
+        "UPDATE emails SET status=$1, simulated=$2, error=$3, sent_at=$4 WHERE id=$5",
+        result["status"], result.get("simulated", False), result.get("error"),
+        now if result["status"] == "sent" else None, em["id"])
     return result
 
 @api_router.post("/emails/{email_id}/send")
 async def send_one(email_id: str, user: dict = Depends(get_current_user)):
-    em = await db.emails.find_one({"_id": email_id, "user_id": user["id"]})
+    em = rec(await pool.fetchrow("SELECT * FROM emails WHERE id=$1 AND user_id=$2", email_id, user["id"]))
     if not em:
         raise HTTPException(status_code=404, detail="Email not found")
     if em.get("status") == "sent":
         return {"status": "sent", "already": True}
     result = await _send_one_email(em)
-    await db.activity.insert_one({
-        "_id": str(uuid.uuid4()), "user_id": user["id"], "type": "manual",
-        "message": (f"Email to {em.get('contact_name','')} ({em.get('company','')}) "
-                    f"{'sent' if result['status']=='sent' else 'failed to send'}."),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
+    await pool.execute("""
+        INSERT INTO activity (id, user_id, type, message, created_at)
+        VALUES ($1,$2,'manual',$3,$4)
+    """, str(uuid.uuid4()), user["id"],
+         (f"Email to {em.get('contact_name','')} ({em.get('company','')}) "
+          f"{'sent' if result['status']=='sent' else 'failed to send'}."),
+         datetime.now(timezone.utc))
     return result
 
 @api_router.post("/emails/send-all")
 async def send_all(user: dict = Depends(get_current_user)):
-    drafts = await db.emails.find(
-        {"user_id": user["id"], "channel": "email", "type": "initial",
-         "status": {"$in": ["draft", "failed"]}}).to_list(1000)
+    drafts = recs(await pool.fetch("""
+        SELECT * FROM emails WHERE user_id=$1 AND channel='email' AND type='initial'
+        AND status = ANY($2::text[]) LIMIT 1000
+    """, user["id"], ["draft", "failed"]))
     sent = 0
     failed = 0
     for em in drafts:
@@ -794,23 +842,23 @@ async def send_all(user: dict = Depends(get_current_user)):
             sent += 1
         else:
             failed += 1
-    await db.activity.insert_one({
-        "_id": str(uuid.uuid4()), "user_id": user["id"], "type": "manual",
-        "message": f"Send all: {sent} email(s) sent, {failed} failed.",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    })
+    await pool.execute("""
+        INSERT INTO activity (id, user_id, type, message, created_at)
+        VALUES ($1,$2,'manual',$3,$4)
+    """, str(uuid.uuid4()), user["id"], f"Send all: {sent} email(s) sent, {failed} failed.",
+         datetime.now(timezone.utc))
     return {"sent": sent, "failed": failed}
 
 @api_router.post("/leads/{lead_id}/replied")
 async def mark_replied(lead_id: str, user: dict = Depends(get_current_user)):
-    res = await db.leads.update_one({"_id": lead_id, "user_id": user["id"]},
-                                    {"$set": {"replied": True}})
-    if res.matched_count == 0:
+    res = await pool.execute("UPDATE leads SET replied=true WHERE id=$1 AND user_id=$2", lead_id, user["id"])
+    if res == "UPDATE 0":
         raise HTTPException(status_code=404, detail="Lead not found")
-    cancelled = await db.emails.update_many(
-        {"lead_id": lead_id, "type": "follow_up", "status": "scheduled"},
-        {"$set": {"status": "cancelled"}})
-    return {"replied": True, "cancelled_followups": cancelled.modified_count}
+    cancelled = await pool.execute(
+        "UPDATE emails SET status='cancelled' WHERE lead_id=$1 AND type='follow_up' AND status='scheduled'",
+        lead_id)
+    cancelled_count = int(cancelled.split()[-1]) if cancelled.startswith("UPDATE") else 0
+    return {"replied": True, "cancelled_followups": cancelled_count}
 
 @api_router.post("/followups/process")
 async def followups_process(user: dict = Depends(get_current_user)):
@@ -828,7 +876,14 @@ async def get_settings(user: dict = Depends(get_current_user)):
 @api_router.put("/settings")
 async def update_settings(data: SettingsInput, user: dict = Depends(get_current_user)):
     payload = data.model_dump()
-    await db.settings.update_one({"user_id": user["id"]}, {"$set": payload}, upsert=True)
+    await get_or_create_settings(user["id"])  # ensure row exists
+    await pool.execute("""
+        UPDATE settings SET daily_target=$1, auto_enabled=$2, regions=$3, industries=$4, offer=$5,
+                            sender_name=$6, tone=$7, skills=$8, headline=$9, experience=$10
+        WHERE user_id=$11
+    """, payload["daily_target"], payload["auto_enabled"], payload["regions"], payload["industries"],
+         payload["offer"], payload["sender_name"], payload["tone"], payload["skills"],
+         payload["headline"], payload["experience"], user["id"])
     return await get_or_create_settings(user["id"])
 
 
@@ -839,7 +894,7 @@ async def scheduler_loop():
     await asyncio.sleep(20)
     while True:
         try:
-            today = datetime.now(timezone.utc).date().isoformat()
+            today = datetime.now(timezone.utc).date()
             # Detect replies first so we don't send follow-ups to people who answered
             try:
                 await scan_replies()
@@ -850,15 +905,15 @@ async def scheduler_loop():
                 await process_due_followups()
             except Exception as e:
                 logger.error(f"Follow-up processing error: {e}")
-            async for s in db.settings.find({"auto_enabled": True}):
+            for s in recs(await pool.fetch("SELECT * FROM settings WHERE auto_enabled=true")):
                 uid = s.get("user_id")
-                last = s.get("last_run") or ""
-                if not uid or last.startswith(today):
+                last_run = s.get("last_run")
+                if not uid or (last_run and last_run.date() == today):
                     continue
                 try:
                     await execute_run(uid, 8, source="auto")
-                    await db.settings.update_one({"user_id": uid},
-                        {"$set": {"last_run": datetime.now(timezone.utc).isoformat()}})
+                    await pool.execute("UPDATE settings SET last_run=$1 WHERE user_id=$2",
+                                       datetime.now(timezone.utc), uid)
                     logger.info(f"Auto run completed for {uid}")
                 except Exception as e:
                     logger.error(f"Auto run failed for {uid}: {e}")
@@ -869,23 +924,28 @@ async def scheduler_loop():
 
 @app.on_event("startup")
 async def startup():
-    await db.users.create_index("email", unique=True)
+    global pool
+    pool = await asyncpg.create_pool(DATABASE_URL, init=_init_connection)
+    async with pool.acquire() as conn:
+        await conn.execute((ROOT_DIR / "schema.sql").read_text())
+
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@outreachpilot.com")
     admin_pw = os.environ.get("ADMIN_PASSWORD", "admin123")
-    existing = await db.users.find_one({"email": admin_email})
+    existing = rec(await pool.fetchrow("SELECT * FROM users WHERE email=$1", admin_email))
     if not existing:
-        await db.users.insert_one({"email": admin_email, "name": "Admin",
-            "password_hash": hash_password(admin_pw), "role": "admin",
-            "created_at": datetime.now(timezone.utc).isoformat()})
+        await pool.execute(
+            "INSERT INTO users (email, name, password_hash, role) VALUES ($1,'Admin',$2,'admin')",
+            admin_email, hash_password(admin_pw))
     elif not verify_password(admin_pw, existing["password_hash"]):
-        await db.users.update_one({"email": admin_email},
-                                  {"$set": {"password_hash": hash_password(admin_pw)}})
+        await pool.execute("UPDATE users SET password_hash=$1 WHERE email=$2",
+                           hash_password(admin_pw), admin_email)
     asyncio.create_task(scheduler_loop())
     logger.info("OutreachPilot started")
 
 @app.on_event("shutdown")
 async def shutdown():
-    client.close()
+    if pool:
+        await pool.close()
 
 
 app.include_router(api_router)
