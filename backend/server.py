@@ -531,6 +531,62 @@ async def process_due_followups(user_id: str = None) -> int:
     return sent
 
 
+def _fetch_reply_senders_sync(days: int = 21) -> set:
+    import imaplib
+    from email.utils import parseaddr
+    senders = set()
+    M = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+    try:
+        M.login(SMTP_USER, SMTP_PASSWORD)
+        M.select("INBOX")
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%d-%b-%Y")
+        typ, data = M.search(None, f'(SINCE {since})')
+        ids = data[0].split() if data and data[0] else []
+        for i in ids[-250:]:
+            typ, msgdata = M.fetch(i, "(BODY[HEADER.FIELDS (FROM)])")
+            for part in msgdata:
+                if isinstance(part, tuple) and part[1]:
+                    hdr = part[1].decode(errors="ignore")
+                    _, addr = parseaddr(hdr)
+                    if addr:
+                        senders.add(addr.lower())
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+    return senders
+
+async def scan_replies(user_id: str = None) -> dict:
+    """Read the inbox over IMAP and auto-stop follow-ups for any lead that replied."""
+    if not (SMTP_USER and SMTP_PASSWORD):
+        return {"matched": 0, "error": "Email not configured"}
+    try:
+        senders = await asyncio.to_thread(_fetch_reply_senders_sync)
+    except Exception as e:
+        logger.error(f"IMAP reply scan failed: {e}")
+        return {"matched": 0, "error": str(e)}
+    q = {"replied": False, "email": {"$ne": ""}}
+    if user_id:
+        q["user_id"] = user_id
+    matched = 0
+    async for lead in db.leads.find(q):
+        if (lead.get("email") or "").lower() in senders:
+            await db.leads.update_one({"_id": lead["_id"]}, {"$set": {"replied": True}})
+            await db.emails.update_many(
+                {"lead_id": lead["_id"], "type": "follow_up", "status": "scheduled"},
+                {"$set": {"status": "cancelled"}})
+            await db.activity.insert_one({
+                "_id": str(uuid.uuid4()), "user_id": lead.get("user_id"), "type": "auto",
+                "message": (f"Reply detected from {lead.get('contact_name','')} "
+                            f"({lead.get('company','')}) — follow-ups auto-stopped."),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+            matched += 1
+    return {"matched": matched}
+
+
+
 async def get_or_create_settings(user_id: str) -> dict:
     s = await db.settings.find_one({"user_id": user_id}, {"_id": 0})
     if not s:
@@ -761,6 +817,10 @@ async def followups_process(user: dict = Depends(get_current_user)):
     sent = await process_due_followups(user["id"])
     return {"sent": sent}
 
+@api_router.post("/replies/scan")
+async def replies_scan(user: dict = Depends(get_current_user)):
+    return await scan_replies(user["id"])
+
 @api_router.get("/settings")
 async def get_settings(user: dict = Depends(get_current_user)):
     return await get_or_create_settings(user["id"])
@@ -780,6 +840,11 @@ async def scheduler_loop():
     while True:
         try:
             today = datetime.now(timezone.utc).date().isoformat()
+            # Detect replies first so we don't send follow-ups to people who answered
+            try:
+                await scan_replies()
+            except Exception as e:
+                logger.error(f"Reply scan error: {e}")
             # Send any follow-ups that are now due
             try:
                 await process_due_followups()

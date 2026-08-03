@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import api from "@/lib/api";
 import { toast } from "sonner";
-import { Zap, Loader2, Save, Mail, Radar, MessageCircle, Send, Clock, Circle } from "lucide-react";
+import { Zap, Loader2, Save, Mail, Radar, MessageCircle, Send, Clock, Circle, Inbox } from "lucide-react";
 
 const TagInput = ({ label, values, onChange, testid }) => {
   const [text, setText] = useState("");
@@ -40,6 +40,7 @@ export default function Automation() {
   const [running, setRunning] = useState(false);
   const [testing, setTesting] = useState(false);
   const [processing, setProcessing] = useState(false);
+  const [scanning, setScanning] = useState(false);
 
   useEffect(() => {
     api.get("/settings").then((r) => setS(r.data)).catch(() => {});
@@ -71,6 +72,20 @@ export default function Automation() {
       toast.error("Could not process follow-ups.");
     } finally {
       setProcessing(false);
+    }
+  };
+
+  const scanReplies = async () => {
+    setScanning(true);
+    toast.info("Reading inbox for replies…");
+    try {
+      const r = await api.post("/replies/scan");
+      if (r.data.error) toast.error(`Scan failed: ${r.data.error}`);
+      else toast.success(`${r.data.matched} reply(ies) detected — follow-ups auto-stopped.`);
+    } catch (e) {
+      toast.error("Could not scan inbox.");
+    } finally {
+      setScanning(false);
     }
   };
 
@@ -124,11 +139,12 @@ export default function Automation() {
         {integ && (
           <div className="bg-[#18181B] border border-zinc-800 rounded-md p-6">
             <h3 className="font-display font-semibold text-lg mb-4">Integrations</h3>
-            <div className="grid sm:grid-cols-3 gap-3">
+            <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-3">
               {[
                 { label: "Email · SMTP", live: integ.email_live, icon: Mail, hint: integ.sender_email || "Add SMTP creds" },
                 { label: "Leads · Apollo", live: integ.leads_live, icon: Radar, hint: integ.leads_live ? "Real leads live" : (integ.leads_blocked ? "Apollo Free plan — upgrade to enable API" : "Add APOLLO_API_KEY") },
                 { label: "WhatsApp · Twilio", live: integ.whatsapp_live, icon: MessageCircle, hint: integ.whatsapp_live ? "Auto-send live" : "Add Twilio creds" },
+                { label: "Replies · IMAP", live: integ.reply_detection_live, icon: Inbox, hint: integ.reply_detection_live ? "Auto-stops follow-ups on reply" : "Uses your email login" },
               ].map((it) => (
                 <div key={it.label} className={`p-3 rounded-sm border ${it.live ? "border-emerald-500/30 bg-emerald-500/10" : "border-zinc-800 bg-[#0f0f11]"}`}>
                   <div className="flex items-center gap-2">
@@ -160,6 +176,15 @@ export default function Automation() {
               >
                 {processing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Clock className="w-4 h-4" />}
                 Process due follow-ups
+              </button>
+              <button
+                data-testid="scan-replies-button"
+                onClick={scanReplies}
+                disabled={scanning}
+                className="flex items-center gap-2 bg-zinc-800 text-white text-sm font-medium px-4 py-2 rounded-sm hover:bg-zinc-700 transition-colors disabled:opacity-60"
+              >
+                {scanning ? <Loader2 className="w-4 h-4 animate-spin" /> : <Inbox className="w-4 h-4" />}
+                Scan inbox for replies
               </button>
             </div>
             {!integ.leads_live && (

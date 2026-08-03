@@ -12,12 +12,12 @@ import {
 } from "lucide-react";
 
 const nav = [
-  { to: "/", label: "Command", icon: LayoutDashboard, end: true, id: "nav-dashboard" },
-  { to: "/profile", label: "Profile & Skills", icon: UserCog, id: "nav-profile" },
-  { to: "/leads", label: "Leads", icon: Users, id: "nav-leads" },
-  { to: "/outbox", label: "Outbox", icon: Send, id: "nav-outbox" },
-  { to: "/automation", label: "Automation", icon: Zap, id: "nav-automation" },
-  { to: "/activity", label: "Activity", icon: ActivityIcon, id: "nav-activity" },
+  { to: "/app", label: "Command", icon: LayoutDashboard, end: true, id: "nav-dashboard" },
+  { to: "/app/profile", label: "Profile & Skills", icon: UserCog, id: "nav-profile" },
+  { to: "/app/leads", label: "Leads", icon: Users, id: "nav-leads" },
+  { to: "/app/outbox", label: "Outbox", icon: Send, id: "nav-outbox" },
+  { to: "/app/automation", label: "Automation", icon: Zap, id: "nav-automation" },
+  { to: "/app/activity", label: "Activity", icon: ActivityIcon, id: "nav-activity" },
 ];
 
 export default function Layout() {
@@ -26,7 +26,7 @@ export default function Layout() {
 
   const handleLogout = async () => {
     await logout();
-    navigate("/login");
+    navigate("/");
   };
 
   return (

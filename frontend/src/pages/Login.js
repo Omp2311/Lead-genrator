@@ -21,7 +21,7 @@ export default function Login() {
     try {
       await login(email, password);
       toast.success("Welcome back, operator.");
-      navigate("/");
+      navigate("/app");
     } catch (err) {
       toast.error(formatApiErrorDetail(err.response?.data?.detail) || err.message);
     } finally {

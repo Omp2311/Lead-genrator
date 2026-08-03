@@ -19,7 +19,7 @@ export default function Register() {
     try {
       await register(name, email, password);
       toast.success("Account created. Welcome aboard.");
-      navigate("/");
+      navigate("/app");
     } catch (err) {
       toast.error(formatApiErrorDetail(err.response?.data?.detail) || err.message);
     } finally {

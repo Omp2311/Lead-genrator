@@ -19,15 +19,14 @@ Build a website that fully automates cold outreach: automatically find real clie
 - Daily autopilot + manual run. Dashboard, Leads, Outbox, Profile, Automation, Activity.
 
 ## Implemented
-- **2026-08-02**: JWT auth + admin seed. AI lead+email pipeline. Dashboard (stats + 7-day chart + autopilot), Leads, Outbox, Automation, Activity. Daily scheduler. (Tested 100%.)
-- **2026-08-03 (this session)**:
-  - **Live email via Gmail SMTP** — verified real delivery (send to omprakashraj100078@gmail.com returned sent, simulated=false).
-  - **Follow-up sequences** — 2 AI follow-ups auto-scheduled per lead (+3d, +6d); cancel on "mark replied"; scheduler sends due ones.
-  - **Profile & Skills page** — skills/headline/experience/offer/tone/targeting; tailors leads + project pitches.
-  - **Project details per lead** — project_idea + estimated_value shown on Leads.
-  - **Editable drafts + manual send** — emails created as drafts; per-email Edit/Send + "Send all"; real SMTP on click.
-  - Integrations status panel + honest LIVE/OFF/blocked indicators; test-email + process-follow-ups buttons.
-  - Backfill defaults in get_or_create_settings. (Tested: FE 100%, BE 100% after fix.)
+- **2026-08-02**: JWT auth + admin seed. AI lead+email pipeline. Dashboard, Leads, Outbox, Automation, Activity. Daily scheduler. (Tested 100%.)
+- **2026-08-03**: Gmail SMTP live email, follow-up sequences, Profile & Skills page, per-lead project ideas + value, editable drafts with manual Send / Send-all.
+- **2026-08-03 (b)**:
+  - **Reply Detection (IMAP)** — scans the Gmail inbox (imap.gmail.com), auto-marks a lead replied and cancels its scheduled follow-ups. Runs hourly in scheduler + manual "Scan inbox for replies" button. Endpoint POST /api/replies/scan.
+  - **Public Sales Landing Page** at `/` (hero, stats, 6 features, how-it-works, pricing showcase, CTA, footer). App moved under `/app/*`; login/register redirect to `/app`.
+
+## Routing
+- `/` public Landing · `/login` · `/register` · `/app` (protected) with nested profile/leads/outbox/automation/activity.
 
 ## Integration Status / Limitations
 - **Email · Gmail SMTP = LIVE** (omprakashraj100078@gmail.com). Real sends work.

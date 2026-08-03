@@ -12,6 +12,7 @@ import Outbox from "@/pages/Outbox";
 import Automation from "@/pages/Automation";
 import Activity from "@/pages/Activity";
 import Profile from "@/pages/Profile";
+import Landing from "@/pages/Landing";
 
 function Protected({ children }) {
   const { user } = useAuth();
@@ -28,7 +29,7 @@ function Protected({ children }) {
 function PublicOnly({ children }) {
   const { user } = useAuth();
   if (user === null) return null;
-  if (user) return <Navigate to="/" replace />;
+  if (user) return <Navigate to="/app" replace />;
   return children;
 }
 
@@ -39,10 +40,11 @@ function App() {
         <BrowserRouter>
           <Toaster theme="dark" position="top-right" richColors />
           <Routes>
+            <Route path="/" element={<Landing />} />
             <Route path="/login" element={<PublicOnly><Login /></PublicOnly>} />
             <Route path="/register" element={<PublicOnly><Register /></PublicOnly>} />
             <Route
-              path="/"
+              path="/app"
               element={
                 <Protected>
                   <Layout />
