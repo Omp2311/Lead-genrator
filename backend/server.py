@@ -536,7 +536,8 @@ async def get_or_create_settings(user_id: str) -> dict:
         default["last_run"] = None
         await db.settings.insert_one({**default, "_id": str(uuid.uuid4())})
         return default
-    return s
+    # Backfill any new schema fields for docs created before they existed
+    return {**SettingsInput().model_dump(), **s}
 
 
 # ---------------------------------------------------------------------------

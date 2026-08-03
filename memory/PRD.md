@@ -1,39 +1,44 @@
 # OutreachPilot — PRD
 
 ## Original Problem Statement
-Build a website that fully automates cold outreach: automatically find real client leads, send 100+ cold emails daily hands-free, and send proposals to WhatsApp when a phone number exists. Target: Dubai, USA, and high-IT-density cities.
+Build a website that fully automates cold outreach: automatically find real client leads, send 100+ cold emails daily hands-free, and send proposals to WhatsApp when a phone number exists. Target: Dubai, USA, and high-IT-density cities. Position it as a sellable product. No payment integration for now.
 
 ## Architecture
-- **Backend**: FastAPI + MongoDB (motor). JWT auth via httpOnly cookies. Emergent LLM key (OpenAI gpt-5.4) for lead generation & email copywriting. Background asyncio scheduler for daily autopilot.
-- **Frontend**: React 19 + React Router + Tailwind + shadcn, "Tactical Dark Mode" design (Cabinet Grotesk / IBM Plex Sans, cyan accent). Recharts for volume chart, sonner toasts.
+- **Backend**: FastAPI + MongoDB (motor). JWT auth (httpOnly cookies). Emergent LLM key (OpenAI gpt-5.4) for lead generation, cold-email + follow-up copywriting, and per-lead project ideas. Background asyncio scheduler (daily autopilot + due follow-up processing).
+- **Frontend**: React 19 + Router + Tailwind + shadcn, "Tactical Dark Mode" (Cabinet Grotesk / IBM Plex Sans, cyan accent). Recharts, sonner.
+- **Integrations**: Gmail SMTP (email, LIVE), Apollo (leads, wired), Twilio (WhatsApp, wired). Features auto-activate from backend/.env keys.
 
 ## User Personas
-- Solo founder / agency owner (full-stack dev) who wants a hands-free B2B lead + outreach engine.
+- Freelancer / agency owner (full-stack + GenAI dev) who wants a hands-free engine that finds clients needing THEIR skills and pitches tailored projects.
 
 ## Core Requirements (static)
-- Auth (register/login/logout/session).
-- AI lead discovery targeting chosen regions/industries.
-- AI-personalized cold email per lead.
-- WhatsApp proposal links for leads with phone numbers.
-- Daily autopilot + manual "run now".
-- Dashboard stats, leads list, outbox, activity log, automation settings.
+- Auth; AI lead discovery tuned to user's skills/regions/industries.
+- Per-lead: pain point, tailored project idea + estimated value, personalized cold email, WhatsApp link.
+- Editable email drafts with manual Send (single) + Send all; real SMTP delivery.
+- Auto follow-up sequences (2 steps) that stop when a lead is marked replied.
+- Daily autopilot + manual run. Dashboard, Leads, Outbox, Profile, Automation, Activity.
 
-## Implemented (2026-08-02)
-- JWT cookie auth + admin seed (admin@outreachpilot.com / admin123).
-- `/api/automation/run` → AI generates realistic leads + personalized emails, stores leads/emails/activity, builds wa.me WhatsApp links.
-- Dashboard (stats + 7-day email volume chart + autopilot status), Leads, Outbox (email/whatsapp tabs), Automation (settings: daily target, regions, industries, offer, tone, autopilot toggle), Activity timeline.
-- Hourly background scheduler runs daily for users with autopilot enabled.
-- Verified: backend 14/14 pytest, frontend Playwright — 100%.
+## Implemented
+- **2026-08-02**: JWT auth + admin seed. AI lead+email pipeline. Dashboard (stats + 7-day chart + autopilot), Leads, Outbox, Automation, Activity. Daily scheduler. (Tested 100%.)
+- **2026-08-03 (this session)**:
+  - **Live email via Gmail SMTP** — verified real delivery (send to omprakashraj100078@gmail.com returned sent, simulated=false).
+  - **Follow-up sequences** — 2 AI follow-ups auto-scheduled per lead (+3d, +6d); cancel on "mark replied"; scheduler sends due ones.
+  - **Profile & Skills page** — skills/headline/experience/offer/tone/targeting; tailors leads + project pitches.
+  - **Project details per lead** — project_idea + estimated_value shown on Leads.
+  - **Editable drafts + manual send** — emails created as drafts; per-email Edit/Send + "Send all"; real SMTP on click.
+  - Integrations status panel + honest LIVE/OFF/blocked indicators; test-email + process-follow-ups buttons.
+  - Backfill defaults in get_or_create_settings. (Tested: FE 100%, BE 100% after fix.)
 
-## Known Mocks / Limitations
-- **Email sending is SIMULATED** (stored with status "sent"; no real SMTP/provider). Real sending needs a provider key (Resend/SendGrid).
-- **Lead data is AI-generated (realistic demo)**, not from a live data provider (Apollo/Hunter need paid API keys).
-- WhatsApp = click-to-send wa.me links (semi-manual), not automated WhatsApp Business API.
+## Integration Status / Limitations
+- **Email · Gmail SMTP = LIVE** (omprakashraj100078@gmail.com). Real sends work.
+- **Leads · Apollo = BLOCKED** — key valid but on Apollo FREE plan; Search API is paid-only (403). App gracefully falls back to **AI demo leads** (fake emails). Autopilot only real-sends to real (Apollo) leads to protect sender reputation; AI-lead emails stay simulated unless manually sent from Outbox.
+- **WhatsApp · Twilio = OFF** — wired, needs TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_WHATSAPP_FROM.
+- No payment integration (per user).
 
 ## Backlog
-- **P0**: Real email sending (Resend/SendGrid) once user provides key; real lead provider integration.
-- **P1**: Twilio WhatsApp automated send; reply tracking / inbox; per-lead approval before send; CSV lead import.
-- **P2**: Follow-up sequences, A/B subject testing, deliverability warm-up, analytics per campaign.
+- **P0**: User upgrades Apollo (paid) → real leads + real delivery end-to-end. Connect Twilio for auto WhatsApp (#3).
+- **P1**: Reply/inbox tracking (IMAP) instead of manual "mark replied"; per-user email settings in UI; deliverability warm-up; CSV lead import.
+- **P2**: Multi-step sequence editor, A/B subjects, analytics per campaign, landing/marketing page for selling the product.
 
 ## Next Tasks
-- Connect a real email provider and lead source when keys are available.
+- #3 Twilio WhatsApp auto-send (needs creds). Then revisit Apollo once upgraded.
