@@ -45,6 +45,8 @@ SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587") or 587)
 SMTP_USER = os.environ.get("SMTP_USER", "").strip()
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "").replace(" ", "").strip()
+IMAP_HOST = os.environ.get("IMAP_HOST", "imap.gmail.com").strip()
+IMAP_PORT = int(os.environ.get("IMAP_PORT", "993") or 993)
 APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY", "").strip()
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
@@ -64,6 +66,7 @@ def integrations_status() -> dict:
         "leads_live": bool(APOLLO_API_KEY) and _apollo_ok is not False,
         "leads_blocked": bool(APOLLO_API_KEY) and _apollo_ok is False,
         "whatsapp_live": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM),
+        "reply_detection_live": bool(SMTP_USER and SMTP_PASSWORD),
     }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
