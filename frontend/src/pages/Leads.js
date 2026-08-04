@@ -1,10 +1,26 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import api from "@/lib/api";
 import { toast } from "sonner";
-import { Users, MapPin, Building2, Mail, Phone, MessageCircle, ExternalLink, CheckCircle2 } from "lucide-react";
+import { formatApiErrorDetail } from "@/lib/api";
+import { Users, MapPin, Building2, Mail, Phone, MessageCircle, ExternalLink, CheckCircle2, Upload, Download, Loader2, BellOff } from "lucide-react";
+
+const CSV_TEMPLATE_HEADER = ["company", "contact_name", "title", "email", "phone", "location",
+  "industry", "website", "pain_point", "project_idea", "estimated_value"];
+
+function downloadCsvTemplate() {
+  const blob = new Blob([CSV_TEMPLATE_HEADER.join(",") + "\n"], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "outreachpilot_leads_template.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 export default function Leads() {
   const [leads, setLeads] = useState(null);
+  const [importing, setImporting] = useState(false);
+  const fileInputRef = useRef(null);
 
   const load = () => api.get("/leads").then((res) => setLeads(res.data)).catch(() => setLeads([]));
 
@@ -22,14 +38,55 @@ export default function Leads() {
     }
   };
 
+  const handleFileChange = async (ev) => {
+    const file = ev.target.files?.[0];
+    ev.target.value = "";
+    if (!file) return;
+    setImporting(true);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const r = await api.post("/leads/import", formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      toast.success(`Imported ${r.data.imported} lead(s) · ${r.data.skipped} skipped`);
+      load();
+    } catch (e) {
+      toast.error(formatApiErrorDetail(e?.response?.data?.detail) || "Import failed.");
+    } finally {
+      setImporting(false);
+    }
+  };
+
   return (
     <div className="p-8 max-w-7xl">
-      <div className="mb-8">
-        <p className="text-xs uppercase tracking-[0.2em] text-zinc-500 mb-2">Prospect database</p>
-        <h1 className="font-display text-4xl font-black tracking-tight">Leads</h1>
-        <p className="text-zinc-400 text-sm mt-2">
-          Decision-makers discovered by the agent across Dubai, US & high-IT cities.
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-4 mb-8">
+        <div>
+          <p className="text-xs uppercase tracking-[0.2em] text-zinc-500 mb-2">Prospect database</p>
+          <h1 className="font-display text-4xl font-black tracking-tight">Leads</h1>
+          <p className="text-zinc-400 text-sm mt-2">
+            Decision-makers discovered by the agent across Dubai, US & high-IT cities.
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <button
+            onClick={downloadCsvTemplate}
+            data-testid="download-csv-template-button"
+            className="flex items-center gap-2 text-sm bg-zinc-800 text-white px-4 py-2 rounded-sm hover:bg-zinc-700 transition-colors"
+          >
+            <Download className="w-4 h-4" /> Template
+          </button>
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={importing}
+            data-testid="import-csv-button"
+            className="flex items-center gap-2 text-sm bg-cyan-400 text-[#09090B] font-semibold px-4 py-2 rounded-sm hover:bg-cyan-300 transition-colors disabled:opacity-60"
+          >
+            {importing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+            Import CSV
+          </button>
+          <input ref={fileInputRef} type="file" accept=".csv" onChange={handleFileChange} className="hidden" data-testid="import-csv-input" />
+        </div>
       </div>
 
       {leads === null ? (
@@ -99,9 +156,20 @@ export default function Leads() {
                 </div>
               )}
 
+              {l.suppressed && (
+                <div className="mt-3 flex items-center gap-2 text-xs text-amber-400" data-testid={`lead-suppressed-${i}`}>
+                  <BellOff className="w-4 h-4" /> Unsubscribed — no outreach sent
+                </div>
+              )}
+
               {l.replied ? (
                 <div className="mt-3 flex items-center gap-2 text-xs text-emerald-400" data-testid={`lead-replied-${i}`}>
                   <CheckCircle2 className="w-4 h-4" /> Replied — follow-ups stopped
+                  {l.reply_intent && l.reply_intent !== "unknown" && (
+                    <span data-testid={`lead-intent-${i}`} className="ml-1 text-[10px] uppercase tracking-wider bg-zinc-800 text-zinc-300 px-1.5 py-0.5 rounded-sm">
+                      {l.reply_intent.replace("_", " ")}
+                    </span>
+                  )}
                 </div>
               ) : (
                 <button

@@ -9,14 +9,24 @@ import {
   LogOut,
   Radar,
   UserCog,
+  Inbox as InboxIcon,
+  GitBranch,
+  BarChart3,
+  CreditCard,
+  UserPlus,
 } from "lucide-react";
 
 const nav = [
   { to: "/app", label: "Command", icon: LayoutDashboard, end: true, id: "nav-dashboard" },
   { to: "/app/profile", label: "Profile & Skills", icon: UserCog, id: "nav-profile" },
   { to: "/app/leads", label: "Leads", icon: Users, id: "nav-leads" },
+  { to: "/app/pipeline", label: "Pipeline", icon: GitBranch, id: "nav-pipeline" },
   { to: "/app/outbox", label: "Outbox", icon: Send, id: "nav-outbox" },
+  { to: "/app/inboxes", label: "Inboxes", icon: InboxIcon, id: "nav-inboxes" },
   { to: "/app/automation", label: "Automation", icon: Zap, id: "nav-automation" },
+  { to: "/app/analytics", label: "Analytics", icon: BarChart3, id: "nav-analytics" },
+  { to: "/app/team", label: "Team", icon: UserPlus, id: "nav-team" },
+  { to: "/app/billing", label: "Billing", icon: CreditCard, id: "nav-billing" },
   { to: "/app/activity", label: "Activity", icon: ActivityIcon, id: "nav-activity" },
 ];
 

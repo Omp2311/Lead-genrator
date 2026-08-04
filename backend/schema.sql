@@ -80,3 +80,88 @@ CREATE TABLE IF NOT EXISTS activity (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_activity_user ON activity(user_id);
+
+-- Suppression list: unsubscribes / manual opt-outs. Checked before every send.
+CREATE TABLE IF NOT EXISTS suppressions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  email TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT 'unsubscribed',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(user_id, email)
+);
+CREATE INDEX IF NOT EXISTS idx_suppressions_user ON suppressions(user_id);
+
+-- Sending inboxes: per-user SMTP/Resend accounts used for rotation + warm-up + daily caps.
+CREATE TABLE IF NOT EXISTS inboxes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  label TEXT NOT NULL DEFAULT 'Inbox',
+  provider TEXT NOT NULL DEFAULT 'smtp',
+  smtp_host TEXT NOT NULL DEFAULT '',
+  smtp_port INT NOT NULL DEFAULT 587,
+  smtp_user TEXT NOT NULL DEFAULT '',
+  smtp_password TEXT NOT NULL DEFAULT '',
+  resend_api_key TEXT NOT NULL DEFAULT '',
+  from_email TEXT NOT NULL DEFAULT '',
+  daily_cap INT NOT NULL DEFAULT 30,
+  warmup_enabled BOOLEAN NOT NULL DEFAULT true,
+  sent_today INT NOT NULL DEFAULT 0,
+  sent_today_date DATE,
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  last_used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_inboxes_user ON inboxes(user_id);
+
+-- Per-email open/click events (raw log; emails table keeps denormalized counters for fast stats).
+CREATE TABLE IF NOT EXISTS email_events (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email_id UUID NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+  type TEXT NOT NULL,
+  url TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_email_events_email ON email_events(email_id);
+
+-- Additive columns for tables that already existed before this migration
+-- (CREATE TABLE IF NOT EXISTS above does not alter an already-created table).
+ALTER TABLE emails ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ;
+ALTER TABLE emails ADD COLUMN IF NOT EXISTS open_count INT NOT NULL DEFAULT 0;
+ALTER TABLE emails ADD COLUMN IF NOT EXISTS clicked_at TIMESTAMPTZ;
+ALTER TABLE emails ADD COLUMN IF NOT EXISTS click_count INT NOT NULL DEFAULT 0;
+ALTER TABLE emails ADD COLUMN IF NOT EXISTS inbox_id UUID REFERENCES inboxes(id) ON DELETE SET NULL;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS suppressed BOOLEAN NOT NULL DEFAULT false;
+
+-- Tier 2: user-defined follow-up sequences (replaces the old hardcoded 2-step ramp).
+CREATE TABLE IF NOT EXISTS sequence_steps (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  step_order INT NOT NULL,
+  delay_days INT NOT NULL DEFAULT 3,
+  angle TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sequence_steps_user ON sequence_steps(user_id, step_order);
+
+-- Tier 2: CRM pipeline stage + freeform notes per lead.
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT 'new';
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS notes TEXT NOT NULL DEFAULT '';
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS reply_intent TEXT;
+
+-- Tier 2: A/B subject-line testing.
+ALTER TABLE emails ADD COLUMN IF NOT EXISTS variant TEXT;
+
+-- Tier 2: meeting-booking link surfaced as a CTA in AI-written emails.
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS meeting_link TEXT NOT NULL DEFAULT '';
+
+-- Tier 3: team seats. A NULL owner_id means this user IS a tenant (owns their own
+-- workspace); a set owner_id means this login shares that owner's entire workspace.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS owner_id UUID REFERENCES users(id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS idx_users_owner ON users(owner_id);
+
+-- Tier 3: billing/subscription state, set via Stripe checkout + webhooks.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'starter';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;

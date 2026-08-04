@@ -35,6 +35,30 @@ def _admin_session():
     return s
 
 
+def _register_session(name, email, password):
+    s = requests.Session()
+    r = s.post(f"{BASE_URL}/api/auth/register",
+               json={"name": name, "email": email, "password": password})
+    assert r.status_code == 200, r.text
+    return s
+
+
+def _login_session(email, password):
+    s = requests.Session()
+    r = s.post(f"{BASE_URL}/api/auth/login", json={"email": email, "password": password})
+    assert r.status_code == 200, r.text
+    return s
+
+
+def _import_one_lead(session, email):
+    csv_body = (
+        "company,contact_name,title,email,phone,location,industry,website,pain_point,project_idea,estimated_value\n"
+        f"Iso Co,Person,CTO,{email},,USA,SaaS,https://example.com,x,y,$1k\n"
+    )
+    r = session.post(f"{BASE_URL}/api/leads/import", files={"file": ("l.csv", csv_body, "text/csv")})
+    assert r.status_code == 200, r.text
+
+
 # ---------------- Auth regression ----------------
 class TestAuth:
     def test_login_admin(self):
@@ -259,3 +283,272 @@ class TestFollowups:
         r = s.post(f"{BASE_URL}/api/followups/process")
         assert r.status_code == 200
         assert isinstance(r.json().get("sent"), int)
+
+
+# ---------------- Suppression list (unsubscribes / opt-outs) ----------------
+class TestSuppressions:
+    def test_add_list_delete(self):
+        s = _admin_session()
+        email = "test_suppress_iter3@example.com"
+        r = s.post(f"{BASE_URL}/api/suppressions", json={"email": email, "reason": "manual"})
+        assert r.status_code == 200, r.text
+        assert r.json()["added"] is True
+
+        # Duplicate add should not error (ON CONFLICT DO NOTHING)
+        r2 = s.post(f"{BASE_URL}/api/suppressions", json={"email": email, "reason": "manual"})
+        assert r2.status_code == 200
+
+        rows = s.get(f"{BASE_URL}/api/suppressions").json()
+        match = next((x for x in rows if x["email"] == email), None)
+        assert match is not None
+
+        r3 = s.delete(f"{BASE_URL}/api/suppressions/{match['id']}")
+        assert r3.status_code == 200
+        assert r3.json()["deleted"] is True
+
+        rows_after = s.get(f"{BASE_URL}/api/suppressions").json()
+        assert not any(x["email"] == email for x in rows_after)
+
+    def test_delete_unknown_returns_404(self):
+        s = _admin_session()
+        r = s.delete(f"{BASE_URL}/api/suppressions/{uuid.uuid4()}")
+        assert r.status_code == 404
+
+
+# ---------------- Sending inboxes (multi-inbox rotation) ----------------
+class TestInboxes:
+    def test_create_list_update_delete(self):
+        s = _admin_session()
+        payload = {
+            "label": "TEST_Inbox", "provider": "smtp", "smtp_host": "smtp.test.invalid",
+            "smtp_port": 587, "smtp_user": "test@test.invalid", "smtp_password": "secret123",
+            "resend_api_key": "", "from_email": "test@test.invalid", "daily_cap": 25,
+            "warmup_enabled": True, "is_active": True,
+        }
+        r = s.post(f"{BASE_URL}/api/inboxes", json=payload)
+        assert r.status_code == 200, r.text
+        d = r.json()
+        inbox_id = d["id"]
+        # Secret must never be echoed back in plaintext
+        assert d["smtp_password"] == "•" * 8
+
+        rows = s.get(f"{BASE_URL}/api/inboxes").json()
+        assert any(i["id"] == inbox_id for i in rows)
+
+        # Update with the masked placeholder unchanged should keep the real secret working
+        upd_payload = {**payload, "label": "TEST_Inbox_Renamed", "smtp_password": d["smtp_password"]}
+        r2 = s.put(f"{BASE_URL}/api/inboxes/{inbox_id}", json=upd_payload)
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["label"] == "TEST_Inbox_Renamed"
+
+        r3 = s.delete(f"{BASE_URL}/api/inboxes/{inbox_id}")
+        assert r3.status_code == 200
+        assert r3.json()["deleted"] is True
+
+    def test_delete_unknown_returns_404(self):
+        s = _admin_session()
+        r = s.delete(f"{BASE_URL}/api/inboxes/{uuid.uuid4()}")
+        assert r.status_code == 404
+
+
+# ---------------- CSV lead import ----------------
+class TestCsvImport:
+    def test_import_creates_leads_and_skips_duplicates(self):
+        s = _admin_session()
+        unique = uuid.uuid4().hex[:8]
+        csv_body = (
+            "company,contact_name,title,email,phone,location,industry,website,pain_point,project_idea,estimated_value\n"
+            f"TEST Co,Jane Doe,CTO,test_csv_{unique}@example.com,,Dubai,SaaS,https://example.com,slow builds,CI speedup,$5k\n"
+            "No Email Row,No Email,CEO,,,,,,,,\n"
+        )
+        files = {"file": ("leads.csv", csv_body, "text/csv")}
+        r = s.post(f"{BASE_URL}/api/leads/import", files=files)
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["imported"] == 1
+        assert d["skipped"] == 1
+
+        leads = s.get(f"{BASE_URL}/api/leads").json()
+        assert any(l["email"] == f"test_csv_{unique}@example.com" and l["lead_source"] == "csv" for l in leads)
+
+        # Re-importing the same row should be skipped as a duplicate
+        r2 = s.post(f"{BASE_URL}/api/leads/import", files={"file": ("leads.csv", csv_body, "text/csv")})
+        assert r2.json()["imported"] == 0
+
+
+# ---------------- Follow-up sequence builder ----------------
+class TestSequence:
+    def test_get_seeds_default_two_steps(self):
+        s = _admin_session()
+        r = s.get(f"{BASE_URL}/api/sequence")
+        assert r.status_code == 200, r.text
+        steps = r.json()
+        assert len(steps) >= 1
+        assert all("delay_days" in st and "angle" in st for st in steps)
+
+    def test_put_replaces_steps_in_order(self):
+        s = _admin_session()
+        original = s.get(f"{BASE_URL}/api/sequence").json()
+        payload = [{"delay_days": 2, "angle": "TEST_quick nudge"},
+                   {"delay_days": 5, "angle": "TEST_case study"},
+                   {"delay_days": 9, "angle": "TEST_breakup"}]
+        r = s.put(f"{BASE_URL}/api/sequence", json=payload)
+        assert r.status_code == 200, r.text
+        steps = r.json()
+        assert [st["delay_days"] for st in steps] == [2, 5, 9]
+        assert [st["angle"] for st in steps] == ["TEST_quick nudge", "TEST_case study", "TEST_breakup"]
+
+        # GET-verify persistence
+        r2 = s.get(f"{BASE_URL}/api/sequence").json()
+        assert [st["delay_days"] for st in r2] == [2, 5, 9]
+
+        # Restore
+        s.put(f"{BASE_URL}/api/sequence", json=[
+            {"delay_days": st["delay_days"], "angle": st["angle"]} for st in original
+        ])
+
+    def test_put_rejects_more_than_ten_steps(self):
+        s = _admin_session()
+        payload = [{"delay_days": 1, "angle": "x"} for _ in range(11)]
+        r = s.put(f"{BASE_URL}/api/sequence", json=payload)
+        assert r.status_code == 400
+
+
+# ---------------- CRM pipeline: lead stage/notes ----------------
+class TestLeadPipeline:
+    def _import_one(self, s):
+        unique = uuid.uuid4().hex[:8]
+        email = f"test_pipeline_{unique}@example.com"
+        csv_body = (
+            "company,contact_name,title,email,phone,location,industry,website,pain_point,project_idea,estimated_value\n"
+            f"TEST Pipeline Co,Sam Lee,COO,{email},,USA,SaaS,https://example.com,x,y,$1k\n"
+        )
+        s.post(f"{BASE_URL}/api/leads/import", files={"file": ("l.csv", csv_body, "text/csv")})
+        leads = s.get(f"{BASE_URL}/api/leads").json()
+        return next(l for l in leads if l["email"] == email)
+
+    def test_new_lead_defaults_to_new_stage(self):
+        s = _admin_session()
+        lead = self._import_one(s)
+        assert lead["stage"] == "new"
+        assert lead["notes"] == ""
+        assert lead["reply_intent"] is None
+
+    def test_update_stage_and_notes(self):
+        s = _admin_session()
+        lead = self._import_one(s)
+        r = s.put(f"{BASE_URL}/api/leads/{lead['id']}", json={"stage": "meeting", "notes": "TEST_ booked call"})
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["stage"] == "meeting"
+        assert d["notes"] == "TEST_ booked call"
+
+    def test_invalid_stage_rejected(self):
+        s = _admin_session()
+        lead = self._import_one(s)
+        r = s.put(f"{BASE_URL}/api/leads/{lead['id']}", json={"stage": "not_a_real_stage"})
+        assert r.status_code == 400
+
+    def test_unknown_lead_returns_404(self):
+        s = _admin_session()
+        r = s.put(f"{BASE_URL}/api/leads/{uuid.uuid4()}", json={"stage": "won"})
+        assert r.status_code == 404
+
+
+# ---------------- Funnel + A/B analytics ----------------
+class TestAnalytics:
+    def test_funnel_shape(self):
+        s = _admin_session()
+        r = s.get(f"{BASE_URL}/api/analytics/funnel")
+        assert r.status_code == 200, r.text
+        d = r.json()
+        for k in ["sent", "opened", "clicked", "stages", "ab_variants"]:
+            assert k in d, f"Missing {k}"
+        for stage in ["new", "contacted", "replied", "meeting", "won", "lost"]:
+            assert stage in d["stages"]
+        assert isinstance(d["ab_variants"], list)
+
+
+# ---------------- Public endpoints (no auth): unsubscribe + tracking pixel ----------------
+class TestPublicEndpoints:
+    def test_unsubscribe_invalid_token_returns_400(self):
+        r = requests.get(f"{BASE_URL}/api/unsubscribe/not-a-real-token")
+        assert r.status_code == 400
+
+    def test_tracking_pixel_returns_gif(self):
+        r = requests.get(f"{BASE_URL}/api/t/{uuid.uuid4()}.gif")
+        assert r.status_code == 200
+        assert r.headers.get("content-type") == "image/gif"
+
+
+# ---------------- Multi-tenant isolation (two independent, unrelated tenants) ----------------
+class TestTenantIsolation:
+    def test_two_owners_cannot_see_each_others_leads(self):
+        unique = uuid.uuid4().hex[:8]
+        email_a = f"test_owner_a_{unique}@example.com"
+        email_b = f"test_owner_b_{unique}@example.com"
+        sa = _register_session("Owner A", email_a, "pw_test_12345")
+        sb = _register_session("Owner B", email_b, "pw_test_12345")
+
+        lead_email_a = f"test_lead_a_{unique}@example.com"
+        lead_email_b = f"test_lead_b_{unique}@example.com"
+        _import_one_lead(sa, lead_email_a)
+        _import_one_lead(sb, lead_email_b)
+
+        leads_a = {l["email"] for l in sa.get(f"{BASE_URL}/api/leads").json()}
+        leads_b = {l["email"] for l in sb.get(f"{BASE_URL}/api/leads").json()}
+        assert lead_email_a in leads_a
+        assert lead_email_a not in leads_b
+        assert lead_email_b in leads_b
+        assert lead_email_b not in leads_a
+
+
+# ---------------- Team seats ----------------
+class TestTeam:
+    def _owner_session(self):
+        unique = uuid.uuid4().hex[:8]
+        email = f"test_team_owner_{unique}@example.com"
+        s = _register_session("Team Owner", email, "pw_test_12345")
+        return s, unique
+
+    def test_owner_sees_self_as_sole_member(self):
+        s, _ = self._owner_session()
+        members = s.get(f"{BASE_URL}/api/team/members").json()
+        assert len(members) == 1
+        assert members[0]["is_owner"] is True
+
+    def test_starter_plan_blocks_second_seat(self):
+        s, unique = self._owner_session()
+        r = s.post(f"{BASE_URL}/api/team/members",
+                   json={"name": "Teammate", "email": f"test_mate_{unique}@example.com", "password": "pw_test_12345"})
+        assert r.status_code == 402
+
+    def test_remove_unknown_member_404(self):
+        s, _ = self._owner_session()
+        r = s.delete(f"{BASE_URL}/api/team/members/{uuid.uuid4()}")
+        assert r.status_code == 404
+
+    def test_remove_self_rejected(self):
+        s, _ = self._owner_session()
+        me = s.get(f"{BASE_URL}/api/auth/me").json()
+        r = s.delete(f"{BASE_URL}/api/team/members/{me['id']}")
+        assert r.status_code == 400
+
+
+# ---------------- Billing ----------------
+class TestBilling:
+    def test_status_shape_for_fresh_owner(self):
+        unique = uuid.uuid4().hex[:8]
+        s = _register_session("Billing Owner", f"test_billing_{unique}@example.com", "pw_test_12345")
+        r = s.get(f"{BASE_URL}/api/billing/status")
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["plan"] == "starter"
+        assert d["is_owner"] is True
+        assert d["limits"]["max_inboxes"] == 2
+
+    def test_checkout_without_stripe_configured_or_unknown_plan(self):
+        unique = uuid.uuid4().hex[:8]
+        s = _register_session("Billing Owner 2", f"test_billing2_{unique}@example.com", "pw_test_12345")
+        r = s.post(f"{BASE_URL}/api/billing/checkout", json={"plan": "not_a_real_plan"})
+        assert r.status_code == 400

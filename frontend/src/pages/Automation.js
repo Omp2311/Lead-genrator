@@ -1,7 +1,189 @@
 import { useEffect, useState } from "react";
 import api from "@/lib/api";
 import { toast } from "sonner";
-import { Zap, Loader2, Save, Mail, Radar, MessageCircle, Send, Clock, Circle, Inbox } from "lucide-react";
+import { formatApiErrorDetail } from "@/lib/api";
+import { Zap, Loader2, Save, Mail, Radar, MessageCircle, Send, Clock, Circle, Inbox, BellOff, Plus, X, GitBranch, ArrowRight } from "lucide-react";
+
+function SequencePanel() {
+  const [steps, setSteps] = useState(null);
+  const [saving, setSaving] = useState(false);
+
+  const load = () => api.get("/sequence").then((r) => setSteps(r.data.map((s) => ({ delay_days: s.delay_days, angle: s.angle })))).catch(() => setSteps([]));
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const update = (i, k, v) => setSteps((prev) => prev.map((s, idx) => (idx === i ? { ...s, [k]: v } : s)));
+  const remove = (i) => setSteps((prev) => prev.filter((_, idx) => idx !== i));
+  const add = () => setSteps((prev) => [...prev, { delay_days: (prev[prev.length - 1]?.delay_days || 0) + 3, angle: "" }]);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const r = await api.put("/sequence", steps);
+      setSteps(r.data.map((s) => ({ delay_days: s.delay_days, angle: s.angle })));
+      toast.success("Sequence saved — future runs will follow these steps.");
+    } catch (e) {
+      toast.error(formatApiErrorDetail(e?.response?.data?.detail) || "Could not save sequence.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="bg-[#18181B] border border-zinc-800 rounded-md p-6">
+      <h3 className="font-display font-semibold text-lg mb-1 flex items-center gap-2">
+        <GitBranch className="w-4 h-4 text-cyan-400" /> Follow-up sequence
+      </h3>
+      <p className="text-sm text-zinc-400 mb-4">
+        Define how many follow-ups to send, how many days apart, and the strategic angle for each —
+        the AI writes the copy per lead, matching your angle.
+      </p>
+      {steps === null ? (
+        <p className="text-xs text-zinc-500 font-mono">Loading…</p>
+      ) : (
+        <div className="space-y-3">
+          {steps.map((s, i) => (
+            <div key={i} data-testid={`sequence-step-${i}`} className="flex items-start gap-3 bg-[#0f0f11] border border-zinc-800/80 rounded-sm p-3">
+              <span className="text-xs font-mono text-cyan-400 mt-2 shrink-0 flex items-center gap-1">
+                <ArrowRight className="w-3.5 h-3.5" /> #{i + 1}
+              </span>
+              <div className="shrink-0">
+                <label className="text-[10px] uppercase tracking-wider text-zinc-500">Days after previous</label>
+                <input
+                  type="number"
+                  min={1}
+                  data-testid={`sequence-delay-${i}`}
+                  value={s.delay_days}
+                  onChange={(e) => update(i, "delay_days", parseInt(e.target.value || "1", 10))}
+                  className="mt-1 w-20 bg-[#18181B] border border-zinc-800 rounded-sm px-2 py-1.5 text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none"
+                />
+              </div>
+              <div className="flex-1">
+                <label className="text-[10px] uppercase tracking-wider text-zinc-500">Angle / strategy for this step</label>
+                <input
+                  data-testid={`sequence-angle-${i}`}
+                  value={s.angle}
+                  onChange={(e) => update(i, "angle", e.target.value)}
+                  placeholder="e.g. Share a relevant case study, <=70 words"
+                  className="mt-1 w-full bg-[#18181B] border border-zinc-800 rounded-sm px-3 py-1.5 text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none"
+                />
+              </div>
+              <button onClick={() => remove(i)} data-testid={`sequence-remove-${i}`} className="text-zinc-500 hover:text-red-400 mt-6">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          ))}
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={add}
+              disabled={steps.length >= 10}
+              data-testid="sequence-add-step-button"
+              className="flex items-center gap-2 text-sm bg-zinc-800 text-white px-3 py-1.5 rounded-sm hover:bg-zinc-700 transition-colors disabled:opacity-60"
+            >
+              <Plus className="w-3.5 h-3.5" /> Add step
+            </button>
+            <button
+              onClick={save}
+              disabled={saving}
+              data-testid="sequence-save-button"
+              className="flex items-center gap-2 text-sm bg-cyan-400 text-[#09090B] font-semibold px-3 py-1.5 rounded-sm hover:bg-cyan-300 transition-colors disabled:opacity-60"
+            >
+              {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />} Save sequence
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SuppressionPanel() {
+  const [list, setList] = useState(null);
+  const [email, setEmail] = useState("");
+  const [adding, setAdding] = useState(false);
+
+  const load = () => api.get("/suppressions").then((r) => setList(r.data)).catch(() => setList([]));
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const add = async () => {
+    const v = email.trim();
+    if (!v) return;
+    setAdding(true);
+    try {
+      await api.post("/suppressions", { email: v, reason: "manual" });
+      setEmail("");
+      toast.success(`${v} added to suppression list.`);
+      load();
+    } catch (e) {
+      toast.error(formatApiErrorDetail(e?.response?.data?.detail) || "Could not add.");
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const remove = async (id) => {
+    try {
+      await api.delete(`/suppressions/${id}`);
+      setList((prev) => prev.filter((s) => s.id !== id));
+    } catch (e) {
+      toast.error("Could not remove.");
+    }
+  };
+
+  return (
+    <div className="bg-[#18181B] border border-zinc-800 rounded-md p-6">
+      <h3 className="font-display font-semibold text-lg mb-1 flex items-center gap-2">
+        <BellOff className="w-4 h-4 text-amber-400" /> Suppression list
+      </h3>
+      <p className="text-sm text-zinc-400 mb-4">
+        Addresses here never receive outreach — recipients land here automatically when they click
+        "unsubscribe", or add them manually below.
+      </p>
+      <div className="flex gap-2 mb-4">
+        <input
+          data-testid="suppression-email-input"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && add()}
+          placeholder="someone@company.com"
+          className="flex-1 bg-[#0f0f11] border border-zinc-800 rounded-sm px-3 py-2 text-sm font-mono focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none"
+        />
+        <button
+          onClick={add}
+          disabled={adding}
+          data-testid="suppression-add-button"
+          className="flex items-center gap-2 bg-zinc-800 text-white text-sm font-medium px-4 py-2 rounded-sm hover:bg-zinc-700 transition-colors disabled:opacity-60"
+        >
+          {adding ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+        </button>
+      </div>
+      {list === null ? (
+        <p className="text-xs text-zinc-500 font-mono">Loading…</p>
+      ) : list.length === 0 ? (
+        <p className="text-xs text-zinc-500">No suppressed addresses.</p>
+      ) : (
+        <div className="space-y-1.5">
+          {list.map((s) => (
+            <div key={s.id} data-testid={`suppression-row-${s.id}`} className="flex items-center justify-between text-xs bg-[#0f0f11] border border-zinc-800/80 rounded-sm px-3 py-2">
+              <span className="font-mono text-zinc-300">{s.email}</span>
+              <div className="flex items-center gap-3">
+                <span className="text-zinc-500">{s.reason}</span>
+                <button onClick={() => remove(s.id)} data-testid={`suppression-remove-${s.id}`} className="text-zinc-500 hover:text-red-400">
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 const TagInput = ({ label, values, onChange, testid }) => {
   const [text, setText] = useState("");
@@ -263,6 +445,10 @@ export default function Automation() {
             />
           </div>
         </div>
+
+        <SequencePanel />
+
+        <SuppressionPanel />
 
         <div className="flex flex-wrap gap-3">
           <button

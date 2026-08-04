@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import api from "@/lib/api";
 import { toast } from "sonner";
-import { Send, MessageCircle, ExternalLink, Mail, Loader2, Pencil, Check, Zap } from "lucide-react";
+import { Send, MessageCircle, ExternalLink, Mail, Loader2, Pencil, Check, Zap, MailOpen, MousePointerClick, BellOff } from "lucide-react";
 
 const StatusBadge = ({ status, simulated }) => (
   <div className="flex items-center gap-1.5 shrink-0">
@@ -15,6 +15,7 @@ const StatusBadge = ({ status, simulated }) => (
           : status === "failed" ? "bg-red-500/10 text-red-400"
           : status === "cancelled" ? "bg-zinc-700/40 text-zinc-500"
           : status === "draft" ? "bg-cyan-500/10 text-cyan-300"
+          : status === "suppressed" ? "bg-amber-500/10 text-amber-400"
           : "bg-amber-500/10 text-amber-400"
       }`}
     >
@@ -22,6 +23,22 @@ const StatusBadge = ({ status, simulated }) => (
     </span>
   </div>
 );
+
+const EngagementBadges = ({ e }) => {
+  if (e.status !== "sent") return null;
+  return (
+    <div className="flex items-center gap-3 mt-2 text-xs">
+      <span className={`flex items-center gap-1 ${e.open_count > 0 ? "text-cyan-400" : "text-zinc-600"}`}>
+        <MailOpen className="w-3.5 h-3.5" /> {e.open_count > 0 ? `Opened${e.open_count > 1 ? ` ×${e.open_count}` : ""}` : "Not opened"}
+      </span>
+      {e.click_count > 0 && (
+        <span className="flex items-center gap-1 text-emerald-400">
+          <MousePointerClick className="w-3.5 h-3.5" /> Clicked ×{e.click_count}
+        </span>
+      )}
+    </div>
+  );
+};
 
 function EmailRow({ e, index, onChanged }) {
   const [editing, setEditing] = useState(false);
@@ -122,8 +139,15 @@ function EmailRow({ e, index, onChanged }) {
         </pre>
       )}
 
+      <EngagementBadges e={e} />
+
       {e.status === "failed" && e.error && (
         <p className="text-xs text-red-400 mt-2">Error: {e.error}</p>
+      )}
+      {e.status === "suppressed" && (
+        <p className="text-xs text-amber-400/80 mt-2 flex items-center gap-1.5">
+          <BellOff className="w-3.5 h-3.5" /> Recipient unsubscribed — not sent.
+        </p>
       )}
 
       {canEdit && (

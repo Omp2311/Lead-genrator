@@ -115,6 +115,17 @@ export default function Profile() {
                 className="mt-1 w-full bg-[#0f0f11] border border-zinc-800 rounded-sm px-3 py-2 text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none transition-colors resize-none"
               />
             </div>
+            <div className="sm:col-span-2">
+              <label className="text-xs uppercase tracking-wider text-zinc-500">Meeting booking link (optional)</label>
+              <input
+                data-testid="profile-meeting-link-input"
+                value={s.meeting_link || ""}
+                onChange={(e) => set("meeting_link", e.target.value)}
+                placeholder="e.g. https://cal.com/you/15min"
+                className="mt-1 w-full bg-[#0f0f11] border border-zinc-800 rounded-sm px-3 py-2 text-sm font-mono focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none transition-colors"
+              />
+              <p className="text-xs text-zinc-500 mt-1">If set, the AI may offer it as a direct way to book time instead of proposing a call.</p>
+            </div>
           </div>
         </div>
 

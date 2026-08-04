@@ -12,6 +12,11 @@ import Outbox from "@/pages/Outbox";
 import Automation from "@/pages/Automation";
 import Activity from "@/pages/Activity";
 import Profile from "@/pages/Profile";
+import Inboxes from "@/pages/Inboxes";
+import Pipeline from "@/pages/Pipeline";
+import Analytics from "@/pages/Analytics";
+import Billing from "@/pages/Billing";
+import Team from "@/pages/Team";
 import Landing from "@/pages/Landing";
 
 function Protected({ children }) {
@@ -54,8 +59,13 @@ function App() {
               <Route index element={<Dashboard />} />
               <Route path="profile" element={<Profile />} />
               <Route path="leads" element={<Leads />} />
+              <Route path="pipeline" element={<Pipeline />} />
               <Route path="outbox" element={<Outbox />} />
+              <Route path="inboxes" element={<Inboxes />} />
               <Route path="automation" element={<Automation />} />
+              <Route path="analytics" element={<Analytics />} />
+              <Route path="billing" element={<Billing />} />
+              <Route path="team" element={<Team />} />
               <Route path="activity" element={<Activity />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />

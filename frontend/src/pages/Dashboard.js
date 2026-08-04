@@ -10,7 +10,7 @@ import {
   Tooltip,
   CartesianGrid,
 } from "recharts";
-import { Users, Send, MessageCircle, Phone, Zap, Loader2, TrendingUp, Clock, CheckCircle2, Mail, Radar, Circle } from "lucide-react";
+import { Users, Send, MessageCircle, Phone, Zap, Loader2, TrendingUp, Clock, CheckCircle2, Mail, Radar, Circle, MailOpen } from "lucide-react";
 
 const StatCard = ({ label, value, sub, icon: Icon, accent, testid }) => (
   <div
@@ -108,8 +108,15 @@ export default function Dashboard() {
             <IntegrationPill testid="integ-whatsapp" label="WhatsApp · Twilio" live={stats.integrations?.whatsapp_live} icon={MessageCircle} />
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
             <StatCard testid="stat-emails-sent" label="Emails sent" value={stats.emails_sent} sub="Cold emails dispatched" icon={Send} accent />
+            <StatCard
+              testid="stat-open-rate"
+              label="Open rate"
+              value={stats.emails_sent ? `${Math.round((stats.opened / stats.emails_sent) * 100)}%` : "—"}
+              sub={`${stats.opened || 0} opened`}
+              icon={MailOpen}
+            />
             <StatCard testid="stat-leads" label="Leads found" value={stats.total_leads} sub="Decision makers discovered" icon={Users} />
             <StatCard testid="stat-whatsapp" label="WhatsApp proposals" value={stats.whatsapp_ready} sub="Ready to fire" icon={MessageCircle} />
             <StatCard testid="stat-phone" label="With phone" value={stats.leads_with_phone} sub="Direct contact available" icon={Phone} />
