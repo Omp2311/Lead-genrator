@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import { useAuth } from "@/context/AuthContext";
 import { formatApiErrorDetail } from "@/lib/api";
@@ -8,6 +8,8 @@ import { Radar, Loader2 } from "lucide-react";
 export default function Register() {
   const { register } = useAuth();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const ref = searchParams.get("ref");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -17,7 +19,7 @@ export default function Register() {
     e.preventDefault();
     setLoading(true);
     try {
-      await register(name, email, password);
+      await register(name, email, password, ref);
       toast.success("Account created. Welcome aboard.");
       navigate("/app");
     } catch (err) {
@@ -35,7 +37,10 @@ export default function Register() {
           <span className="font-display font-extrabold text-lg">OutreachPilot</span>
         </div>
         <p className="text-xs uppercase tracking-[0.2em] text-zinc-500 mb-2">New operator</p>
-        <h2 className="font-display text-3xl font-bold tracking-tight mb-6">Create account</h2>
+        <h2 className="font-display text-3xl font-bold tracking-tight mb-2">Create account</h2>
+        {ref && (
+          <p className="text-xs text-cyan-400 mb-4" data-testid="referral-banner">Signing up via a referral link.</p>
+        )}
 
         <form onSubmit={submit} className="space-y-4">
           <div>

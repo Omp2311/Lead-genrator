@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import api from "@/lib/api";
 import { toast } from "sonner";
-import { Loader2, Save, User, Sparkles, Briefcase } from "lucide-react";
+import { Loader2, Save, User, Sparkles, Briefcase, Palette } from "lucide-react";
 
 const TagInput = ({ label, values, onChange, testid, placeholder }) => {
   const [text, setText] = useState("");
@@ -152,6 +152,38 @@ export default function Profile() {
           </h3>
           <TagInput label="Target regions" values={s.regions || []} onChange={(v) => set("regions", v)} testid="profile-regions-input" />
           <TagInput label="Target industries" values={s.industries || []} onChange={(v) => set("industries", v)} testid="profile-industries-input" />
+        </div>
+
+        <div className="bg-[#18181B] border border-zinc-800 rounded-md p-6 space-y-5">
+          <h3 className="font-display font-semibold text-lg flex items-center gap-2">
+            <Palette className="w-4 h-4 text-cyan-400" /> White-label branding
+          </h3>
+          <p className="text-sm text-zinc-400">
+            Optional — if set, teammates and clients invited into this workspace see your brand
+            in the sidebar instead of "OutreachPilot".
+          </p>
+          <div className="grid sm:grid-cols-2 gap-5">
+            <div>
+              <label className="text-xs uppercase tracking-wider text-zinc-500">Brand name</label>
+              <input
+                data-testid="profile-brand-name-input"
+                value={s.brand_name || ""}
+                onChange={(e) => set("brand_name", e.target.value)}
+                placeholder="e.g. Acme Growth"
+                className="mt-1 w-full bg-[#0f0f11] border border-zinc-800 rounded-sm px-3 py-2 text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none transition-colors"
+              />
+            </div>
+            <div>
+              <label className="text-xs uppercase tracking-wider text-zinc-500">Logo URL</label>
+              <input
+                data-testid="profile-brand-logo-input"
+                value={s.brand_logo_url || ""}
+                onChange={(e) => set("brand_logo_url", e.target.value)}
+                placeholder="https://yourdomain.com/logo.png"
+                className="mt-1 w-full bg-[#0f0f11] border border-zinc-800 rounded-sm px-3 py-2 text-sm font-mono focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none transition-colors"
+              />
+            </div>
+          </div>
         </div>
 
         <button

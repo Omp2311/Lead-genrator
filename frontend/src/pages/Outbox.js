@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import api from "@/lib/api";
 import { toast } from "sonner";
-import { Send, MessageCircle, ExternalLink, Mail, Loader2, Pencil, Check, Zap, MailOpen, MousePointerClick, BellOff } from "lucide-react";
+import { Send, MessageCircle, ExternalLink, Mail, Loader2, Pencil, Check, Zap, MailOpen, MousePointerClick, BellOff, ShieldAlert, Mic } from "lucide-react";
 
 const StatusBadge = ({ status, simulated }) => (
   <div className="flex items-center gap-1.5 shrink-0">
@@ -47,9 +47,39 @@ function EmailRow({ e, index, onChanged }) {
   const [body, setBody] = useState(e.body || "");
   const [sending, setSending] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [checkingSpam, setCheckingSpam] = useState(false);
+  const [spamResult, setSpamResult] = useState(null);
+  const [generatingVoice, setGeneratingVoice] = useState(false);
+  const [voiceNoteUrl, setVoiceNoteUrl] = useState(e.voice_note_url || null);
 
   const canEdit = e.status === "draft" || e.status === "failed";
-  const stepLabel = e.type === "follow_up" ? `Follow-up ${e.step - 1}` : "Initial";
+  const stepLabel = e.type === "follow_up" ? `Follow-up ${e.step - 1}`
+    : e.type === "reply_draft" ? "Suggested reply" : "Initial";
+
+  const checkSpam = async () => {
+    setCheckingSpam(true);
+    try {
+      const r = await api.post("/emails/spam-check", { subject, body });
+      setSpamResult(r.data);
+    } catch (err) {
+      toast.error("Could not check deliverability.");
+    } finally {
+      setCheckingSpam(false);
+    }
+  };
+
+  const generateVoiceNote = async () => {
+    setGeneratingVoice(true);
+    try {
+      const r = await api.post(`/emails/${e.id}/voice-note`);
+      setVoiceNoteUrl(r.data.voice_note_url);
+      toast.success("Voice note ready.");
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Voice note generation failed.");
+    } finally {
+      setGeneratingVoice(false);
+    }
+  };
 
   const save = async () => {
     setSaving(true);
@@ -141,6 +171,30 @@ function EmailRow({ e, index, onChanged }) {
 
       <EngagementBadges e={e} />
 
+      {spamResult && (
+        <div
+          data-testid={`spam-result-${index}`}
+          className={`mt-3 text-xs rounded-sm border p-2.5 ${
+            spamResult.score >= 80 ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+              : spamResult.score >= 50 ? "border-amber-500/30 bg-amber-500/10 text-amber-300"
+              : "border-red-500/30 bg-red-500/10 text-red-300"
+          }`}
+        >
+          <p className="font-semibold flex items-center gap-1.5">
+            <ShieldAlert className="w-3.5 h-3.5" /> Deliverability score: {spamResult.score}/100
+          </p>
+          {spamResult.flags.length > 0 && (
+            <ul className="mt-1 list-disc list-inside space-y-0.5 text-[11px] opacity-90">
+              {spamResult.flags.map((f) => <li key={f}>{f}</li>)}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {voiceNoteUrl && (
+        <audio controls src={voiceNoteUrl} data-testid={`voice-note-player-${index}`} className="mt-3 w-full h-9" />
+      )}
+
       {e.status === "failed" && e.error && (
         <p className="text-xs text-red-400 mt-2">Error: {e.error}</p>
       )}
@@ -166,6 +220,24 @@ function EmailRow({ e, index, onChanged }) {
             className="flex items-center gap-2 text-sm bg-zinc-800 text-white px-4 py-2 rounded-sm hover:bg-zinc-700 transition-colors"
           >
             <Pencil className="w-4 h-4" /> {editing ? "Close" : "Edit"}
+          </button>
+          <button
+            onClick={checkSpam}
+            disabled={checkingSpam}
+            data-testid={`check-spam-${index}`}
+            className="flex items-center gap-2 text-sm bg-zinc-800 text-white px-4 py-2 rounded-sm hover:bg-zinc-700 transition-colors disabled:opacity-60"
+          >
+            {checkingSpam ? <Loader2 className="w-4 h-4 animate-spin" /> : <ShieldAlert className="w-4 h-4" />}
+            Check deliverability
+          </button>
+          <button
+            onClick={generateVoiceNote}
+            disabled={generatingVoice}
+            data-testid={`generate-voice-note-${index}`}
+            className="flex items-center gap-2 text-sm bg-zinc-800 text-white px-4 py-2 rounded-sm hover:bg-zinc-700 transition-colors disabled:opacity-60"
+          >
+            {generatingVoice ? <Loader2 className="w-4 h-4 animate-spin" /> : <Mic className="w-4 h-4" />}
+            {voiceNoteUrl ? "Regenerate voice note" : "Generate voice note"}
           </button>
         </div>
       )}

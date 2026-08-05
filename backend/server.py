@@ -12,6 +12,9 @@ import secrets
 import asyncio
 import csv
 import io
+import re
+import html as html_lib
+import hashlib
 from datetime import datetime, timezone, timedelta, date
 from typing import List, Optional
 from urllib.parse import quote
@@ -88,6 +91,8 @@ PLAN_LIMITS = {
     "agency": {"max_inboxes": 15, "max_team_seats": 15, "max_daily_target": 1000},
 }
 
+VOICE_NOTES_DIR = ROOT_DIR / "voice_notes"
+
 _apollo_ok = None  # None=untested, True=working, False=blocked (e.g. free plan)
 
 def _email_configured() -> bool:
@@ -123,6 +128,7 @@ logger = logging.getLogger("outreachpilot")
 
 app = FastAPI(title="OutreachPilot")
 api_router = APIRouter(prefix="/api")
+public_router = APIRouter(prefix="/api/public/v1")
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +187,20 @@ def tenant_id(user: dict) -> str:
     """
     return user.get("owner_id") or user["id"]
 
+async def get_api_tenant(request: Request) -> str:
+    """Auth for /api/public/v1/* — a long-lived API key instead of a login cookie."""
+    auth = request.headers.get("Authorization", "")
+    key = auth[7:] if auth.startswith("Bearer ") else request.headers.get("X-API-Key", "")
+    if not key:
+        raise HTTPException(status_code=401, detail="Missing API key (Authorization: Bearer <key>)")
+    key_hash = hashlib.sha256(key.encode()).hexdigest()
+    row = rec(await pool.fetchrow("SELECT * FROM api_keys WHERE key_hash=$1", key_hash))
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    await pool.execute("UPDATE api_keys SET last_used_at=$1 WHERE id=$2",
+                       datetime.now(timezone.utc), row["id"])
+    return row["user_id"]  # already the tenant id — set at key-creation time
+
 async def plan_limits_for(tid: str) -> dict:
     plan = await pool.fetchval("SELECT plan FROM users WHERE id=$1", tid) or "starter"
     return PLAN_LIMITS.get(plan, PLAN_LIMITS["starter"])
@@ -193,6 +213,7 @@ class RegisterInput(BaseModel):
     name: str
     email: EmailStr
     password: str
+    ref: Optional[str] = None
 
 class LoginInput(BaseModel):
     email: EmailStr
@@ -217,6 +238,8 @@ class SettingsInput(BaseModel):
     headline: str = "Full-stack & GenAI engineer building custom software for growing companies"
     experience: str = "5+ years shipping full-stack and AI products for startups and enterprises"
     meeting_link: str = ""
+    brand_name: str = ""
+    brand_logo_url: str = ""
 
 class EmailUpdate(BaseModel):
     to_email: Optional[str] = None
@@ -238,6 +261,24 @@ class TeamMemberInput(BaseModel):
 
 class CheckoutInput(BaseModel):
     plan: str
+
+class SpamCheckInput(BaseModel):
+    subject: str = ""
+    body: str = ""
+
+class ApiKeyInput(BaseModel):
+    label: str = "API key"
+
+class PublicLeadInput(BaseModel):
+    email: EmailStr
+    company: str = ""
+    contact_name: str = ""
+    title: str = ""
+    phone: str = ""
+    location: str = ""
+    industry: str = ""
+    website: str = ""
+    pain_point: str = ""
 
 class InboxInput(BaseModel):
     label: str = "Inbox"
@@ -338,6 +379,7 @@ async def generate_emails(settings: dict, leads: List[dict]):
     compact = [{"i": idx, "company": l.get("company"), "contact_name": l.get("contact_name"),
                 "title": l.get("title"), "pain_point": l.get("pain_point"),
                 "project_idea": l.get("project_idea"), "industry": l.get("industry"),
+                "live_signal": l.get("live_signal") or "",
                 "subject_style": style_by_variant[subject_variant(idx)]}
                for idx, l in enumerate(leads)]
     meeting_note = (f'\nA booking link is available ({meeting_link}) — you may offer it as an '
@@ -345,8 +387,11 @@ async def generate_emails(settings: dict, leads: List[dict]):
     prompt = f"""Write a personalized cold email for each prospect below.
 Sender name: {sender}. Offer: {offer}. Tone: {tone}.
 Rules: <=120 words, one clear CTA (a 15-min call), reference their pain_point naturally,
-and pitch the specific "project_idea" as what you could build for them. No fluff, no
-"I hope this finds you well". Subject line <=6 words, matching each prospect's "subject_style".{meeting_note}
+and pitch the specific "project_idea" as what you could build for them. If "live_signal" is
+non-empty for a prospect, it's a real, current snippet pulled from their own website — weave
+in one specific detail from it naturally if it fits; ignore it if it doesn't add anything
+concrete. No fluff, no "I hope this finds you well". Subject line <=6 words, matching each
+prospect's "subject_style".{meeting_note}
 Prospects: {json.dumps(compact)}
 Return a JSON array where each item has: "i" (matching index), "subject", "body".
 Body should use \\n for line breaks and end with "{sender}". Return ONLY JSON."""
@@ -429,6 +474,55 @@ async def record_inbox_send(inbox_id: str):
     await pool.execute(
         "UPDATE inboxes SET sent_today=$1, sent_today_date=$2, last_used_at=$3 WHERE id=$4",
         sent_today + 1, today, datetime.now(timezone.utc), inbox_id)
+
+
+# ---------------------------------------------------------------------------
+# Deliverability / spam-score heuristic — pure local check, no external API
+# ---------------------------------------------------------------------------
+SPAM_TRIGGER_PHRASES = [
+    "100% free", "act now", "buy now", "cash bonus", "cheap", "congratulations",
+    "double your", "earn money", "for free", "guarantee", "limited time", "no obligation",
+    "no purchase necessary", "risk-free", "winner", "you have been selected",
+    "dear friend", "make money fast", "click here", "urgent",
+]
+
+def spam_score(subject: str, body: str) -> dict:
+    subject = subject or ""
+    body = body or ""
+    text = f"{subject}\n{body}"
+    lower = text.lower()
+    score = 100
+    flags = []
+
+    hits = [p for p in SPAM_TRIGGER_PHRASES if p in lower]
+    if hits:
+        score -= min(30, 6 * len(hits))
+        flags.append(f"Spam trigger phrase(s): {', '.join(hits[:5])}")
+
+    exclam = text.count("!")
+    if exclam > 1:
+        score -= min(15, exclam * 5)
+        flags.append(f"{exclam} exclamation marks")
+
+    caps_words = [w for w in re.findall(r"[A-Za-z]{3,}", subject) if w.isupper()]
+    if caps_words:
+        score -= min(15, 5 * len(caps_words))
+        flags.append(f"ALL-CAPS word(s) in subject: {', '.join(caps_words)}")
+
+    if len(subject) > 60:
+        score -= 5
+        flags.append("Subject line longer than 60 characters")
+    if not subject.strip():
+        score -= 20
+        flags.append("Empty subject line")
+
+    link_count = len(re.findall(r"https?://", body))
+    if link_count > 2:
+        score -= min(15, 5 * (link_count - 2))
+        flags.append(f"{link_count} links in body")
+
+    score = max(0, min(100, score))
+    return {"score": score, "flags": flags}
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +692,40 @@ async def source_leads(settings: dict, count: int, region=None, industry=None):
     return ai, "ai"
 
 
+# ---------------------------------------------------------------------------
+# Live-signal personalization: pull a fresh, real detail from the lead's own
+# homepage instead of relying purely on LLM invention.
+# ---------------------------------------------------------------------------
+def _clean_html_text(raw: str) -> str:
+    text = html_lib.unescape(raw)
+    return re.sub(r"\s+", " ", text).strip()
+
+async def fetch_company_signal(website: str) -> str:
+    """Best-effort: title + meta description from a lead's own website, truncated. Empty on any failure."""
+    if not website:
+        return ""
+    url = website if website.startswith("http") else f"https://{website}"
+    try:
+        async with httpx.AsyncClient(timeout=6, follow_redirects=True) as c:
+            resp = await c.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; OutreachPilotBot/1.0)"})
+        if resp.is_error:
+            return ""
+        page = resp.text[:20000]
+        title_m = re.search(r"<title[^>]*>(.*?)</title>", page, re.I | re.S)
+        desc_m = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']*)', page, re.I)
+        parts = [_clean_html_text(m.group(1)) for m in (title_m, desc_m) if m and m.group(1).strip()]
+        return " — ".join(parts)[:300]
+    except Exception as e:
+        logger.warning(f"Live-signal fetch failed for {website}: {e}")
+        return ""
+
+async def attach_live_signals(leads: List[dict]) -> List[dict]:
+    async def _one(lead):
+        lead["live_signal"] = await fetch_company_signal(lead.get("website", ""))
+        return lead
+    return list(await asyncio.gather(*[_one(l) for l in leads]))
+
+
 DEFAULT_SEQUENCE_STEPS = [
     {"step_order": 1, "delay_days": 3,
      "angle": "Nudge: reference the first email lightly, add one new angle/proof point, <=70 words."},
@@ -656,6 +784,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
         settings = {**settings, "tone": tone}
 
     leads, lead_source = await source_leads(settings, count, region, industry)
+    leads = await attach_live_signals(leads)
     has_inbox = bool(await pool.fetchval(
         "SELECT count(*) FROM inboxes WHERE user_id=$1 AND is_active=true", user_id))
     deliver = (_email_configured() or has_inbox) and lead_source == "apollo"
@@ -823,6 +952,73 @@ async def classify_reply_intent(body: str) -> str:
         logger.error(f"Reply intent classification failed: {e}")
         return "unknown"
 
+AUTO_DRAFT_INTENTS = ("interested", "question")
+
+async def generate_reply_draft(settings: dict, incoming_body: str, intent: str) -> dict:
+    """Draft a suggested reply-to-the-reply. Lands in the Outbox as an editable draft."""
+    sender = settings.get("sender_name", "Alex")
+    offer = settings.get("offer", "custom software development")
+    meeting_link = (settings.get("meeting_link") or "").strip()
+    meeting_note = f' A booking link is available: {meeting_link}.' if meeting_link else ""
+    system = ("You are an expert at replying to inbound cold-email responses. Write a short, "
+              "warm, professional reply. Output ONLY valid JSON.")
+    prompt = f"""A prospect replied to a cold email. Their reply intent was classified as "{intent}".
+Sender: {sender}. Offer: {offer}.{meeting_note}
+Their reply:
+{incoming_body[:800]}
+
+Write a short reply (<=90 words) that directly responds to what they said and moves the
+conversation forward appropriately for a "{intent}" reply. End with "{sender}".
+Return JSON: {{"subject": "...", "body": "..."}}. Return ONLY JSON."""
+    raw = await llm_call(system, prompt)
+    return _extract_json(raw)
+
+
+# ---------------------------------------------------------------------------
+# LinkedIn outreach drafting — text only, for the user to copy-paste themselves.
+# Deliberately NOT automated: LinkedIn's ToS prohibits automating a personal
+# account, and doing so risks the user's account being banned.
+# ---------------------------------------------------------------------------
+async def generate_linkedin_message(settings: dict, lead: dict) -> dict:
+    sender = settings.get("sender_name", "Alex")
+    offer = settings.get("offer", "custom software development")
+    system = ("You write short, natural LinkedIn outreach text — a connection request note "
+              "and a first message. Output ONLY valid JSON.")
+    prompt = f"""Write a LinkedIn connection note and a short first message for this prospect.
+Sender: {sender}. Offer: {offer}.
+Prospect: {lead.get('contact_name','')}, {lead.get('title','')} at {lead.get('company','')}.
+Pain point: {lead.get('pain_point','')}.
+
+Connection note: <=300 characters (LinkedIn's limit), no pitch, just a genuine reason to connect.
+First message (sent only after they accept): <=60 words, references the pain_point, one soft CTA.
+Both end with "{sender}".
+Return JSON: {{"connection_note": "...", "first_message": "..."}}. Return ONLY JSON."""
+    raw = await llm_call(system, prompt)
+    return _extract_json(raw)
+
+
+# ---------------------------------------------------------------------------
+# Voice-note personalization: script via the usual LLM, audio via OpenAI TTS
+# (OpenAI specifically — Anthropic has no text-to-speech endpoint).
+# ---------------------------------------------------------------------------
+async def generate_voice_script(settings: dict, em: dict) -> str:
+    sender = settings.get("sender_name", "Alex")
+    system = ("You write short voice-over scripts for personalized sales voice notes. "
+              "Output plain spoken text only — no markdown, no labels.")
+    prompt = f"""Turn this cold email into a warm, natural-sounding spoken voice note script
+(<=70 words), first person, as if {sender} is leaving a friendly voicemail for the recipient.
+No email formatting, no "Subject:", just natural spoken words ending with a simple sign-off.
+Email subject: {em.get('subject', '')}
+Email body: {em.get('body', '')}"""
+    raw = await llm_call(system, prompt)
+    return raw.strip().strip('"')
+
+async def synthesize_voice(script: str) -> bytes:
+    if not openai_client:
+        raise RuntimeError("OPENAI_API_KEY not configured")
+    resp = await openai_client.audio.speech.create(model="tts-1", voice="alloy", input=script)
+    return resp.read() if hasattr(resp, "read") else bytes(resp.content)
+
 def _fetch_replies_sync(days: int = 21) -> dict:
     """Returns {sender_email_lower: body_snippet} for inbox messages in the time window."""
     import imaplib
@@ -893,12 +1089,28 @@ async def scan_replies(user_id: str = None) -> dict:
             await pool.execute(
                 "UPDATE emails SET status='cancelled' WHERE lead_id=$1 AND type='follow_up' AND status='scheduled'",
                 lead["id"])
+            draft_note = ""
+            if intent in AUTO_DRAFT_INTENTS:
+                try:
+                    lead_settings = await get_or_create_settings(lead.get("user_id"))
+                    draft = await generate_reply_draft(lead_settings, replies[addr], intent)
+                    await pool.execute("""
+                        INSERT INTO emails (id, user_id, lead_id, company, contact_name, to_email, subject,
+                                             body, channel, step, type, status, simulated, created_at, lead_source)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'email',1,'reply_draft','draft',false,$9,$10)
+                    """, str(uuid.uuid4()), lead.get("user_id"), lead["id"], lead.get("company", ""),
+                         lead.get("contact_name", ""), lead.get("email", ""),
+                         draft.get("subject", "Re: following up"), draft.get("body", ""),
+                         datetime.now(timezone.utc), lead.get("lead_source"))
+                    draft_note = " A suggested reply is ready in the Outbox."
+                except Exception as e:
+                    logger.error(f"Reply draft generation failed: {e}")
             await pool.execute("""
                 INSERT INTO activity (id, user_id, type, message, created_at)
                 VALUES ($1,$2,'auto',$3,$4)
             """, str(uuid.uuid4()), lead.get("user_id"),
                  (f"Reply detected from {lead.get('contact_name','')} "
-                  f"({lead.get('company','')}) — intent: {intent}. Follow-ups auto-stopped."),
+                  f"({lead.get('company','')}) — intent: {intent}. Follow-ups auto-stopped.{draft_note}"),
                  datetime.now(timezone.utc))
             matched += 1
     return {"matched": matched}
@@ -925,14 +1137,28 @@ async def get_or_create_settings(user_id: str) -> dict:
 # ---------------------------------------------------------------------------
 # Auth routes
 # ---------------------------------------------------------------------------
+async def _gen_referral_code() -> str:
+    for _ in range(5):
+        code = secrets.token_hex(4).upper()
+        if not await pool.fetchval("SELECT 1 FROM users WHERE referral_code=$1", code):
+            return code
+    return secrets.token_hex(6).upper()
+
 @api_router.post("/auth/register")
 async def register(data: RegisterInput, response: Response):
     email = data.email.lower()
     if await pool.fetchrow("SELECT 1 FROM users WHERE email=$1", email):
         raise HTTPException(status_code=400, detail="Email already registered")
+    referred_by = None
+    if data.ref:
+        referrer = rec(await pool.fetchrow("SELECT id FROM users WHERE referral_code=$1", data.ref.strip().upper()))
+        if referrer:
+            referred_by = referrer["id"]
+    referral_code = await _gen_referral_code()
     row = await pool.fetchrow("""
-        INSERT INTO users (email, name, password_hash, role) VALUES ($1,$2,$3,'user') RETURNING id
-    """, email, data.name, hash_password(data.password))
+        INSERT INTO users (email, name, password_hash, role, referral_code, referred_by)
+        VALUES ($1,$2,$3,'user',$4,$5) RETURNING id
+    """, email, data.name, hash_password(data.password), referral_code, referred_by)
     uid = row["id"]
     set_auth_cookies(response, create_access_token(uid, email), create_refresh_token(uid))
     return {"id": uid, "email": email, "name": data.name, "role": "user", "owner_id": None}
@@ -1069,6 +1295,23 @@ async def update_lead(lead_id: str, data: LeadUpdate, user: dict = Depends(get_c
         await pool.execute(f"UPDATE leads SET {set_clause} WHERE id=$1", lead_id, *upd.values())
     return rec(await pool.fetchrow("SELECT * FROM leads WHERE id=$1", lead_id))
 
+@api_router.post("/leads/{lead_id}/linkedin-draft")
+async def draft_linkedin_message(lead_id: str, user: dict = Depends(get_current_user)):
+    tid = tenant_id(user)
+    lead = rec(await pool.fetchrow("SELECT * FROM leads WHERE id=$1 AND user_id=$2", lead_id, tid))
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    settings = await get_or_create_settings(tid)
+    try:
+        draft = await generate_linkedin_message(settings, lead)
+    except Exception as e:
+        logger.error(f"LinkedIn draft generation failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Draft generation failed: {e}")
+    await pool.execute(
+        "UPDATE leads SET linkedin_note=$1, linkedin_message=$2 WHERE id=$3",
+        draft.get("connection_note", ""), draft.get("first_message", ""), lead_id)
+    return rec(await pool.fetchrow("SELECT * FROM leads WHERE id=$1", lead_id))
+
 @api_router.get("/emails")
 async def list_emails(channel: Optional[str] = None, user: dict = Depends(get_current_user)):
     if channel:
@@ -1097,6 +1340,39 @@ async def edit_email(email_id: str, data: EmailUpdate, user: dict = Depends(get_
         set_clause = ", ".join(f"{k}=${i + 2}" for i, k in enumerate(upd.keys()))
         await pool.execute(f"UPDATE emails SET {set_clause} WHERE id=$1", email_id, *upd.values())
     return rec(await pool.fetchrow("SELECT * FROM emails WHERE id=$1", email_id))
+
+@api_router.post("/emails/spam-check")
+async def check_spam_score(data: SpamCheckInput, user: dict = Depends(get_current_user)):
+    return spam_score(data.subject, data.body)
+
+@api_router.post("/emails/{email_id}/voice-note")
+async def generate_voice_note(email_id: str, user: dict = Depends(get_current_user)):
+    tid = tenant_id(user)
+    em = rec(await pool.fetchrow("SELECT * FROM emails WHERE id=$1 AND user_id=$2", email_id, tid))
+    if not em:
+        raise HTTPException(status_code=404, detail="Email not found")
+    if not openai_client:
+        raise HTTPException(status_code=400,
+                            detail="Voice notes require OPENAI_API_KEY (OpenAI does the text-to-speech step)")
+    settings = await get_or_create_settings(tid)
+    try:
+        script = await generate_voice_script(settings, em)
+        audio_bytes = await synthesize_voice(script)
+    except Exception as e:
+        logger.error(f"Voice note generation failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Voice generation failed: {e}")
+    VOICE_NOTES_DIR.mkdir(parents=True, exist_ok=True)
+    (VOICE_NOTES_DIR / f"{email_id}.mp3").write_bytes(audio_bytes)
+    url = f"{BACKEND_URL}/api/voice/{email_id}.mp3" if BACKEND_URL else f"/api/voice/{email_id}.mp3"
+    await pool.execute("UPDATE emails SET voice_note_url=$1 WHERE id=$2", url, email_id)
+    return {"voice_note_url": url}
+
+@api_router.get("/voice/{email_id}.mp3")
+async def get_voice_note(email_id: str):
+    path = VOICE_NOTES_DIR / f"{email_id}.mp3"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Voice note not found")
+    return Response(content=path.read_bytes(), media_type="audio/mpeg")
 
 async def _send_one_email(em: dict, user_id: str) -> dict:
     """Manual send always attempts real delivery to the address shown."""
@@ -1192,11 +1468,13 @@ async def update_settings(data: SettingsInput, user: dict = Depends(get_current_
     await get_or_create_settings(tid)  # ensure row exists
     await pool.execute("""
         UPDATE settings SET daily_target=$1, auto_enabled=$2, regions=$3, industries=$4, offer=$5,
-                            sender_name=$6, tone=$7, skills=$8, headline=$9, experience=$10, meeting_link=$11
-        WHERE user_id=$12
+                            sender_name=$6, tone=$7, skills=$8, headline=$9, experience=$10, meeting_link=$11,
+                            brand_name=$12, brand_logo_url=$13
+        WHERE user_id=$14
     """, payload["daily_target"], payload["auto_enabled"], payload["regions"], payload["industries"],
          payload["offer"], payload["sender_name"], payload["tone"], payload["skills"],
-         payload["headline"], payload["experience"], payload["meeting_link"], tid)
+         payload["headline"], payload["experience"], payload["meeting_link"],
+         payload["brand_name"], payload["brand_logo_url"], tid)
     return await get_or_create_settings(tid)
 
 
@@ -1389,6 +1667,25 @@ async def remove_suppression_route(suppression_id: str, user: dict = Depends(get
 
 
 # ---------------------------------------------------------------------------
+# Referrals — tracked and shown to the user; no automated reward-crediting yet
+# ---------------------------------------------------------------------------
+@api_router.get("/referrals/status")
+async def referral_status(user: dict = Depends(get_current_user)):
+    tid = tenant_id(user)
+    owner = rec(await pool.fetchrow("SELECT referral_code FROM users WHERE id=$1", tid))
+    code = (owner or {}).get("referral_code")
+    if not code:
+        code = await _gen_referral_code()
+        await pool.execute("UPDATE users SET referral_code=$1 WHERE id=$2", code, tid)
+    referred_count = await pool.fetchval("SELECT count(*) FROM users WHERE referred_by=$1", tid)
+    return {
+        "referral_code": code,
+        "referral_url": f"{FRONTEND_URL}/register?ref={code}",
+        "referred_count": referred_count,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Team seats: invited members share the owner's entire workspace
 # ---------------------------------------------------------------------------
 @api_router.get("/team/members")
@@ -1526,6 +1823,66 @@ async def billing_webhook(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# API keys — for Zapier/Make and other generic HTTP/webhook integrations
+# ---------------------------------------------------------------------------
+_KEY_PREFIX = "op_"
+
+@api_router.get("/api-keys")
+async def list_api_keys(user: dict = Depends(get_current_user)):
+    return recs(await pool.fetch(
+        "SELECT id, label, key_preview, created_at, last_used_at FROM api_keys WHERE user_id=$1 ORDER BY created_at DESC",
+        tenant_id(user)))
+
+@api_router.post("/api-keys")
+async def create_api_key(data: ApiKeyInput, user: dict = Depends(get_current_user)):
+    raw_key = _KEY_PREFIX + secrets.token_urlsafe(32)
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    preview = raw_key[:10] + "…"
+    row = await pool.fetchrow("""
+        INSERT INTO api_keys (id, user_id, label, key_hash, key_preview)
+        VALUES ($1,$2,$3,$4,$5) RETURNING id, label, key_preview, created_at
+    """, str(uuid.uuid4()), tenant_id(user), data.label, key_hash, preview)
+    return {**rec(row), "key": raw_key}  # full key is only ever shown here, once
+
+@api_router.delete("/api-keys/{key_id}")
+async def delete_api_key(key_id: str, user: dict = Depends(get_current_user)):
+    res = await pool.execute("DELETE FROM api_keys WHERE id=$1 AND user_id=$2", key_id, tenant_id(user))
+    if res == "DELETE 0":
+        raise HTTPException(status_code=404, detail="Not found")
+    return {"deleted": True}
+
+
+# ---------------------------------------------------------------------------
+# Public API (api_key auth, not cookies) — Zapier/Make and generic integrations
+# ---------------------------------------------------------------------------
+@public_router.get("/leads")
+async def public_list_leads(tenant: str = Depends(get_api_tenant)):
+    return recs(await pool.fetch(
+        "SELECT * FROM leads WHERE user_id=$1 ORDER BY created_at DESC LIMIT 500", tenant))
+
+@public_router.post("/leads")
+async def public_create_lead(data: PublicLeadInput, tenant: str = Depends(get_api_tenant)):
+    email = data.email.lower()
+    if await pool.fetchval("SELECT 1 FROM leads WHERE user_id=$1 AND email=$2", tenant, email):
+        raise HTTPException(status_code=409, detail="A lead with this email already exists")
+    suppressed_lead = await is_suppressed(tenant, email)
+    lead_id = str(uuid.uuid4())
+    await pool.execute("""
+        INSERT INTO leads (id, user_id, company, contact_name, title, email, phone, location,
+                            industry, website, pain_point, created_at, source, lead_source, replied, suppressed)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'api','api',false,$13)
+    """, lead_id, tenant, data.company, data.contact_name, data.title, email, data.phone,
+         data.location, data.industry, data.website, data.pain_point,
+         datetime.now(timezone.utc), suppressed_lead)
+    return {"id": lead_id, "created": True}
+
+@public_router.get("/emails")
+async def public_list_emails(tenant: str = Depends(get_api_tenant)):
+    return recs(await pool.fetch(
+        "SELECT * FROM emails WHERE user_id=$1 ORDER BY created_at DESC LIMIT 500", tenant))
+
+
+# ---------------------------------------------------------------------------
 # Public endpoints hit by email clients — no auth (unsubscribe link, open pixel, click redirect)
 # ---------------------------------------------------------------------------
 @api_router.get("/unsubscribe/{token}")
@@ -1634,6 +1991,7 @@ async def shutdown():
 
 
 app.include_router(api_router)
+app.include_router(public_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[FRONTEND_URL],

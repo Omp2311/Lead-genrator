@@ -5,9 +5,9 @@ import { toast } from "sonner";
 import { CreditCard, Check, Loader2, ExternalLink } from "lucide-react";
 
 const PLANS = [
-  { key: "starter", name: "Starter", price: "$29/mo", features: ["2 inboxes", "1 seat", "50 emails/day"] },
-  { key: "pro", name: "Pro", price: "$79/mo", features: ["5 inboxes", "3 seats", "300 emails/day"] },
-  { key: "agency", name: "Agency", price: "$199/mo", features: ["15 inboxes", "15 seats", "1000 emails/day"] },
+  { key: "starter", name: "Starter", price: "Free", features: ["2 inboxes", "1 seat", "50 emails/day"] },
+  { key: "pro", name: "Pro", price: "$29/mo", features: ["5 inboxes", "3 seats", "300 emails/day"] },
+  { key: "agency", name: "Agency", price: "$79/mo", features: ["15 inboxes", "15 seats", "1000 emails/day"] },
 ];
 
 export default function Billing() {
@@ -91,15 +91,21 @@ export default function Billing() {
                   </li>
                 ))}
               </ul>
-              <button
-                onClick={() => upgrade(p.key)}
-                disabled={isCurrent || !status.is_owner || loadingPlan === p.key}
-                data-testid={`plan-select-${p.key}`}
-                className="mt-5 w-full flex items-center justify-center gap-2 bg-cyan-400 text-[#09090B] font-semibold px-4 py-2 rounded-sm hover:bg-cyan-300 transition-colors disabled:opacity-40"
-              >
-                {loadingPlan === p.key ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
-                {isCurrent ? "Current plan" : "Upgrade"}
-              </button>
+              {p.key === "starter" ? (
+                <p className="mt-5 text-center text-xs text-zinc-500 py-2">
+                  {isCurrent ? "Current plan · free by default" : "Cancel your subscription to return here"}
+                </p>
+              ) : (
+                <button
+                  onClick={() => upgrade(p.key)}
+                  disabled={isCurrent || !status.is_owner || loadingPlan === p.key}
+                  data-testid={`plan-select-${p.key}`}
+                  className="mt-5 w-full flex items-center justify-center gap-2 bg-cyan-400 text-[#09090B] font-semibold px-4 py-2 rounded-sm hover:bg-cyan-300 transition-colors disabled:opacity-40"
+                >
+                  {loadingPlan === p.key ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                  {isCurrent ? "Current plan" : "Upgrade"}
+                </button>
+              )}
             </div>
           );
         })}

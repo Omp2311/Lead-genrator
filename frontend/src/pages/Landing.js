@@ -12,7 +12,7 @@ const features = [
   { icon: Sparkles, title: "Skill-Matched Projects", desc: "Set your skills once. Every lead comes with a tailored project idea and an estimated deal value." },
   { icon: Mail, title: "Personalized Cold Emails", desc: "Each email is hand-written by AI around the prospect's real pain point — then sent from your own inbox." },
   { icon: MessageCircle, title: "WhatsApp Proposals", desc: "Got a phone number? A ready-to-fire WhatsApp proposal is generated for instant, high-response outreach." },
-  { icon: RefreshCcw, title: "Auto Follow-ups", desc: "Two smart follow-ups are scheduled automatically for every prospect who doesn't reply." },
+  { icon: RefreshCcw, title: "Auto Follow-ups", desc: "Build your own multi-step follow-up sequence — the agent writes and schedules every step automatically for prospects who don't reply." },
   { icon: Inbox, title: "Reply Detection", desc: "The app reads your inbox and instantly stops the sequence the moment someone replies. Zero manual work." },
 ];
 
@@ -23,9 +23,9 @@ const steps = [
 ];
 
 const plans = [
-  { name: "Starter", price: "Free", tag: "While in beta", features: ["AI lead discovery", "Personalized cold emails", "WhatsApp proposal links", "Manual send from dashboard"], cta: "Get started", highlight: false },
-  { name: "Pro", price: "$29", per: "/mo", tag: "Most popular", features: ["Everything in Starter", "Daily autopilot (100+/day)", "Auto follow-up sequences", "Inbox reply detection", "Send from your own SMTP"], cta: "Get started", highlight: true },
-  { name: "Agency", price: "$99", per: "/mo", tag: "Scale", features: ["Everything in Pro", "Real lead provider (Apollo)", "Automated WhatsApp (Twilio)", "Priority support"], cta: "Get started", highlight: false },
+  { name: "Starter", price: "Free", tag: "No card required", features: ["2 sending inboxes", "1 seat", "50 emails/day", "Full CRM pipeline & analytics"], cta: "Get started", highlight: false },
+  { name: "Pro", price: "$29", per: "/mo", tag: "Most popular", features: ["Everything in Starter", "5 sending inboxes", "3 team seats", "300 emails/day"], cta: "Get started", highlight: true },
+  { name: "Agency", price: "$79", per: "/mo", tag: "Scale", features: ["Everything in Pro", "15 sending inboxes", "15 team seats", "1000 emails/day"], cta: "Get started", highlight: false },
 ];
 
 const Nav = () => (
@@ -194,7 +194,7 @@ export default function Landing() {
             </div>
           ))}
         </div>
-        <p className="text-center text-xs text-zinc-600 mt-6">Plans shown for illustration — no payment required to start.</p>
+        <p className="text-center text-xs text-zinc-600 mt-6">No card required to start on Starter — upgrade any time from Billing.</p>
       </section>
 
       {/* CTA */}

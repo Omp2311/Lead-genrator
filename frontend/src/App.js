@@ -17,6 +17,8 @@ import Pipeline from "@/pages/Pipeline";
 import Analytics from "@/pages/Analytics";
 import Billing from "@/pages/Billing";
 import Team from "@/pages/Team";
+import Referrals from "@/pages/Referrals";
+import Docs from "@/pages/Docs";
 import Landing from "@/pages/Landing";
 
 function Protected({ children }) {
@@ -66,6 +68,8 @@ function App() {
               <Route path="analytics" element={<Analytics />} />
               <Route path="billing" element={<Billing />} />
               <Route path="team" element={<Team />} />
+              <Route path="referrals" element={<Referrals />} />
+              <Route path="docs" element={<Docs />} />
               <Route path="activity" element={<Activity />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />

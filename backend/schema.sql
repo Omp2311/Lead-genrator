@@ -165,3 +165,32 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'starter';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_status TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;
+
+-- Tier 4: AI voice-note personalization (generated on demand, served from local disk).
+ALTER TABLE emails ADD COLUMN IF NOT EXISTS voice_note_url TEXT;
+
+-- Tier 5: white-label branding, shown in the in-app sidebar to a workspace's own team/clients.
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS brand_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS brand_logo_url TEXT NOT NULL DEFAULT '';
+
+-- Tier 5: referrals — tracked, not auto-rewarded (no reward-crediting logic exists yet).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT UNIQUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by UUID REFERENCES users(id) ON DELETE SET NULL;
+
+-- Tier 5: public API keys, for Zapier/Make-style generic webhook/HTTP integrations.
+CREATE TABLE IF NOT EXISTS api_keys (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  label TEXT NOT NULL DEFAULT 'API key',
+  key_hash TEXT NOT NULL,
+  key_preview TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_used_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
+
+-- Tier 5: AI-drafted LinkedIn outreach text — manual copy-paste only, never automated
+-- (LinkedIn's ToS prohibits automating a personal account; see PRD notes).
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS linkedin_note TEXT;
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS linkedin_message TEXT;

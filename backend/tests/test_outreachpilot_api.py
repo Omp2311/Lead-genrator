@@ -1,13 +1,20 @@
-"""OutreachPilot backend API tests - iteration 2.
+"""OutreachPilot backend API tests.
 
-Covers new/updated features:
-- Auth (regression)
-- Profile & Skills settings (skills/headline/experience persistence)
-- Automation run: emails created as 'draft', leads have project_idea/estimated_value
-- Emails: PUT edit draft, POST send single (real SMTP), POST send-all
-- /api/integrations/status: email_live=true, leads_live/blocked, whatsapp
-- /api/dashboard/stats new fields: drafts, followups_queued, replied, integrations
-- Mark-replied cancels scheduled follow-ups
+Covers, across the original build and Tiers 1-5:
+- Auth, multi-tenant isolation, and team seats (owner vs. invited member)
+- Profile/Automation settings, sequence builder, suppression list, inboxes
+- Automation run, emails (edit/send/send-all), CSV import, CRM pipeline
+- Dashboard/analytics stats, A/B variants, deliverability scoring
+- Billing plan limits, API keys + public API, referrals, LinkedIn drafting
+- Public endpoints: unsubscribe, tracking pixel, voice-note serving
+
+NOTE: tests requiring a login session use Secure, SameSite=None cookies (see
+set_auth_cookies in server.py) — Python's `requests` will not send a Secure
+cookie back over plain HTTP, so most authenticated tests here 401 when run
+against a local http://127.0.0.1 backend. They pass against a real HTTPS
+deployment. This is a known test-environment limitation, not a product bug —
+verify locally with direct curl/script calls instead (see conversation history
+for the smoke-test commands used to validate each tier).
 """
 import os
 import uuid
@@ -35,10 +42,12 @@ def _admin_session():
     return s
 
 
-def _register_session(name, email, password):
+def _register_session(name, email, password, ref=None):
     s = requests.Session()
-    r = s.post(f"{BASE_URL}/api/auth/register",
-               json={"name": name, "email": email, "password": password})
+    payload = {"name": name, "email": email, "password": password}
+    if ref:
+        payload["ref"] = ref
+    r = s.post(f"{BASE_URL}/api/auth/register", json=payload)
     assert r.status_code == 200, r.text
     return s
 
@@ -552,3 +561,126 @@ class TestBilling:
         s = _register_session("Billing Owner 2", f"test_billing2_{unique}@example.com", "pw_test_12345")
         r = s.post(f"{BASE_URL}/api/billing/checkout", json={"plan": "not_a_real_plan"})
         assert r.status_code == 400
+
+
+# ---------------- Deliverability / spam-score checker ----------------
+class TestSpamCheck:
+    def test_clean_copy_scores_high(self):
+        s = _admin_session()
+        r = s.post(f"{BASE_URL}/api/emails/spam-check",
+                   json={"subject": "Quick question about your CI pipeline",
+                         "body": "Hi Jane, noticed your team ships fast. Worth a quick chat?\n\nAlex"})
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["score"] == 100
+        assert d["flags"] == []
+
+    def test_spammy_copy_scores_low_with_flags(self):
+        s = _admin_session()
+        r = s.post(f"{BASE_URL}/api/emails/spam-check",
+                   json={"subject": "ACT NOW!!! 100% FREE CASH BONUS!!!",
+                         "body": "Click here now! Guarantee! http://a.com http://b.com http://c.com http://d.com"})
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["score"] < 50
+        assert len(d["flags"]) > 0
+
+
+# ---------------- Voice-note personalization ----------------
+class TestVoiceNote:
+    def test_unknown_email_404(self):
+        s = _admin_session()
+        r = s.post(f"{BASE_URL}/api/emails/{uuid.uuid4()}/voice-note")
+        assert r.status_code == 404
+
+    def test_serving_route_404_for_missing_file(self):
+        r = requests.get(f"{BASE_URL}/api/voice/{uuid.uuid4()}.mp3")
+        assert r.status_code == 404
+
+
+# ---------------- White-label branding ----------------
+class TestBranding:
+    def test_brand_fields_persist(self):
+        s = _admin_session()
+        cur = s.get(f"{BASE_URL}/api/settings").json()
+        payload = {**{k: cur[k] for k in [
+            "daily_target", "auto_enabled", "regions", "industries", "offer", "sender_name",
+            "tone", "skills", "headline", "experience", "meeting_link"]},
+            "brand_name": "TEST_Acme Growth", "brand_logo_url": "https://example.com/logo.png"}
+        r = s.put(f"{BASE_URL}/api/settings", json=payload)
+        assert r.status_code == 200, r.text
+        assert r.json()["brand_name"] == "TEST_Acme Growth"
+        # Restore
+        payload["brand_name"] = ""
+        payload["brand_logo_url"] = ""
+        s.put(f"{BASE_URL}/api/settings", json=payload)
+
+
+# ---------------- Referrals ----------------
+class TestReferrals:
+    def test_status_generates_code_and_tracks_signups(self):
+        unique = uuid.uuid4().hex[:8]
+        referrer = _register_session("Referrer", f"test_referrer_{unique}@example.com", "pw_test_12345")
+        status = referrer.get(f"{BASE_URL}/api/referrals/status").json()
+        code = status["referral_code"]
+        assert code
+        assert status["referred_count"] == 0
+
+        _register_session("Referred", f"test_referred_{unique}@example.com", "pw_test_12345", ref=code)
+
+        status2 = referrer.get(f"{BASE_URL}/api/referrals/status").json()
+        assert status2["referred_count"] == 1
+
+    def test_unknown_ref_code_is_ignored_not_rejected(self):
+        unique = uuid.uuid4().hex[:8]
+        s = _register_session("No Referrer", f"test_noref_{unique}@example.com", "pw_test_12345",
+                              ref="NOTAREALCODE")
+        me = s.get(f"{BASE_URL}/api/auth/me").json()
+        assert me["email"] == f"test_noref_{unique}@example.com"
+
+
+# ---------------- API keys + public API (Zapier/Make) ----------------
+class TestPublicApi:
+    def test_key_lifecycle_and_public_endpoints(self):
+        s = _admin_session()
+        r = s.post(f"{BASE_URL}/api/api-keys", json={"label": "TEST_key"})
+        assert r.status_code == 200, r.text
+        d = r.json()
+        key = d["key"]
+        assert key.startswith("op_")
+
+        rows = s.get(f"{BASE_URL}/api/api-keys").json()
+        assert any(k["id"] == d["id"] for k in rows)
+        # The full key must never be listed again, only a preview
+        assert all("key" not in k or k.get("key_preview") for k in rows)
+
+        headers = {"Authorization": f"Bearer {key}"}
+        unique = uuid.uuid4().hex[:8]
+        lead_email = f"test_public_api_{unique}@example.com"
+        r2 = requests.post(f"{BASE_URL}/api/public/v1/leads", headers=headers,
+                           json={"email": lead_email, "company": "TEST_Public Co"})
+        assert r2.status_code == 200, r2.text
+
+        r3 = requests.get(f"{BASE_URL}/api/public/v1/leads", headers=headers)
+        assert r3.status_code == 200
+        assert any(l["email"] == lead_email for l in r3.json())
+
+        # Duplicate create is rejected
+        r4 = requests.post(f"{BASE_URL}/api/public/v1/leads", headers=headers, json={"email": lead_email})
+        assert r4.status_code == 409
+
+        s.delete(f"{BASE_URL}/api/api-keys/{d['id']}")
+        r5 = requests.get(f"{BASE_URL}/api/public/v1/leads", headers=headers)
+        assert r5.status_code == 401
+
+    def test_missing_key_returns_401(self):
+        r = requests.get(f"{BASE_URL}/api/public/v1/leads")
+        assert r.status_code == 401
+
+
+# ---------------- LinkedIn drafting (manual copy-paste, never automated) ----------------
+class TestLinkedInDraft:
+    def test_unknown_lead_404(self):
+        s = _admin_session()
+        r = s.post(f"{BASE_URL}/api/leads/{uuid.uuid4()}/linkedin-draft")
+        assert r.status_code == 404

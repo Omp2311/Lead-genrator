@@ -1,5 +1,7 @@
+import { useEffect, useState } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
+import api from "@/lib/api";
 import {
   LayoutDashboard,
   Users,
@@ -14,6 +16,8 @@ import {
   BarChart3,
   CreditCard,
   UserPlus,
+  Gift,
+  BookOpen,
 } from "lucide-react";
 
 const nav = [
@@ -27,26 +31,39 @@ const nav = [
   { to: "/app/analytics", label: "Analytics", icon: BarChart3, id: "nav-analytics" },
   { to: "/app/team", label: "Team", icon: UserPlus, id: "nav-team" },
   { to: "/app/billing", label: "Billing", icon: CreditCard, id: "nav-billing" },
+  { to: "/app/referrals", label: "Referrals", icon: Gift, id: "nav-referrals" },
+  { to: "/app/docs", label: "Docs & API", icon: BookOpen, id: "nav-docs" },
   { to: "/app/activity", label: "Activity", icon: ActivityIcon, id: "nav-activity" },
 ];
 
 export default function Layout() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
+  const [brand, setBrand] = useState(null);
+
+  useEffect(() => {
+    api.get("/settings").then((r) => setBrand(r.data)).catch(() => {});
+  }, []);
 
   const handleLogout = async () => {
     await logout();
     navigate("/");
   };
 
+  const brandName = brand?.brand_name || "OutreachPilot";
+
   return (
     <div className="min-h-screen flex bg-[#09090B] text-white">
       <aside className="w-60 shrink-0 border-r border-zinc-800 flex flex-col fixed h-screen bg-[#0c0c0e]">
         <div className="px-6 py-6 border-b border-zinc-800">
           <div className="flex items-center gap-2">
-            <Radar className="w-6 h-6 text-cyan-400" strokeWidth={2.2} />
-            <span className="font-display font-extrabold text-lg tracking-tight">
-              Outreach<span className="text-cyan-400">Pilot</span>
+            {brand?.brand_logo_url ? (
+              <img src={brand.brand_logo_url} alt={brandName} className="w-6 h-6 rounded-sm object-cover" />
+            ) : (
+              <Radar className="w-6 h-6 text-cyan-400" strokeWidth={2.2} />
+            )}
+            <span className="font-display font-extrabold text-lg tracking-tight" data-testid="sidebar-brand-name">
+              {brand?.brand_name ? brandName : (<>Outreach<span className="text-cyan-400">Pilot</span></>)}
             </span>
           </div>
           <p className="text-[10px] uppercase tracking-[0.25em] text-zinc-600 mt-2">

@@ -52,6 +52,9 @@ __pycache__/
 venv/
 .venv/
 
+# Generated voice-note audio (local disk storage, not source)
+backend/voice_notes/
+
 # Development tools
 chainlit.md
 .chainlit
