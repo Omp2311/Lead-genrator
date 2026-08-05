@@ -150,11 +150,14 @@ def create_refresh_token(user_id: str) -> str:
                "exp": datetime.now(timezone.utc) + timedelta(days=7)}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
+COOKIE_SECURE = FRONTEND_URL.startswith("https://")
+COOKIE_SAMESITE = "none" if COOKIE_SECURE else "lax"
+
 def set_auth_cookies(response: Response, access: str, refresh: str):
-    response.set_cookie("access_token", access, httponly=True, secure=True,
-                        samesite="none", max_age=43200, path="/")
-    response.set_cookie("refresh_token", refresh, httponly=True, secure=True,
-                        samesite="none", max_age=604800, path="/")
+    response.set_cookie("access_token", access, httponly=True, secure=COOKIE_SECURE,
+                        samesite=COOKIE_SAMESITE, max_age=43200, path="/")
+    response.set_cookie("refresh_token", refresh, httponly=True, secure=COOKIE_SECURE,
+                        samesite=COOKIE_SAMESITE, max_age=604800, path="/")
 
 async def get_current_user(request: Request) -> dict:
     token = request.cookies.get("access_token")
@@ -1197,7 +1200,7 @@ async def refresh(request: Request, response: Response):
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
         response.set_cookie("access_token", create_access_token(user["id"], user["email"]),
-                            httponly=True, secure=True, samesite="none", max_age=43200, path="/")
+                            httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE, max_age=43200, path="/")
         return {"message": "refreshed"}
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
@@ -1971,16 +1974,19 @@ async def startup():
     async with pool.acquire() as conn:
         await conn.execute((ROOT_DIR / "schema.sql").read_text())
 
-    admin_email = os.environ.get("ADMIN_EMAIL", "admin@outreachpilot.com")
-    admin_pw = os.environ.get("ADMIN_PASSWORD", "admin123")
-    existing = rec(await pool.fetchrow("SELECT * FROM users WHERE email=$1", admin_email))
-    if not existing:
-        await pool.execute(
-            "INSERT INTO users (email, name, password_hash, role) VALUES ($1,'Admin',$2,'admin')",
-            admin_email, hash_password(admin_pw))
-    elif not verify_password(admin_pw, existing["password_hash"]):
-        await pool.execute("UPDATE users SET password_hash=$1 WHERE email=$2",
-                           hash_password(admin_pw), admin_email)
+    admin_email = os.environ.get("ADMIN_EMAIL", "").strip()
+    admin_pw = os.environ.get("ADMIN_PASSWORD", "").strip()
+    if admin_email and admin_pw:
+        existing = rec(await pool.fetchrow("SELECT * FROM users WHERE email=$1", admin_email))
+        if not existing:
+            await pool.execute(
+                "INSERT INTO users (email, name, password_hash, role) VALUES ($1,'Admin',$2,'admin')",
+                admin_email, hash_password(admin_pw))
+        elif not verify_password(admin_pw, existing["password_hash"]):
+            await pool.execute("UPDATE users SET password_hash=$1 WHERE email=$2",
+                               hash_password(admin_pw), admin_email)
+    else:
+        logger.warning("ADMIN_EMAIL/ADMIN_PASSWORD not set — skipping admin account seeding")
     asyncio.create_task(scheduler_loop())
     logger.info("OutreachPilot started")
 

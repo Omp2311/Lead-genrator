@@ -1,7 +1,0 @@
-INFO:     Started server process [13304]
-INFO:     Waiting for application startup.
-2026-08-04 23:51:00,445 - outreachpilot - INFO - OutreachPilot started
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
-2026-08-04 23:51:20,456 - outreachpilot - ERROR - Auto run failed for 9c4d38d2-737f-4129-9360-1e0f21895312: No LLM provider available/working (set ANTHROPIC_API_KEY and/or OPENAI_API_KEY in backend/.env). Last error: None
-2026-08-04 23:51:20,459 - outreachpilot - ERROR - Auto run failed for c0f425a4-ddf4-46b7-8629-2597fb70bd58: No LLM provider available/working (set ANTHROPIC_API_KEY and/or OPENAI_API_KEY in backend/.env). Last error: None

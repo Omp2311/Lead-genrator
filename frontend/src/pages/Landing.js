@@ -5,7 +5,7 @@ import {
 } from "lucide-react";
 
 const HERO =
-  "https://images.unsplash.com/photo-1639322537228-f710d846310a?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzMzV8MHwxfHNlYXJjaHwyfHxkYXJrJTIwYWJzdHJhY3QlMjBuZXR3b3JrJTIwbm9kZXMlMjB0ZWNobm9sb2d5fGVufDB8fHxibGFja3wxNzg1NzQ0NTQ2fDA&ixlib=rb-4.1.0&q=85";
+  "https://images.unsplash.com/photo-1639322537228-f710d846310a?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzMzV8MHwxfHNlYXJjaHwyfHxkYXJrJTIwYWJzdHJhY3QlMjBuZXR3b3JrJTIwbm9kZXMlMjB0ZWNobm9sb2d5fGVufDB8fHxibGFja3wxNzg1NzQ0NTQ2fDA&ixlib=rb-4.1.0&q=60&w=1920";
 
 const features = [
   { icon: Users, title: "AI Lead Discovery", desc: "The agent finds real decision-makers in Dubai, the US & high-IT cities — no lists to buy, no manual scraping." },
@@ -61,7 +61,7 @@ export default function Landing() {
 
       {/* Hero */}
       <header className="relative pt-32 pb-24 overflow-hidden">
-        <img src={HERO} alt="" className="absolute inset-0 w-full h-full object-cover opacity-25" />
+        <img src={HERO} alt="" fetchPriority="high" className="absolute inset-0 w-full h-full object-cover opacity-25" />
         <div className="absolute inset-0 bg-gradient-to-b from-[#09090B] via-[#09090B]/70 to-[#09090B]" />
         <div className="absolute -top-24 left-1/2 -translate-x-1/2 w-[600px] h-[600px] bg-cyan-500/10 blur-[120px] rounded-full" />
         <div className="relative max-w-5xl mx-auto px-6 text-center op-fade-up">
@@ -101,9 +101,9 @@ export default function Landing() {
           { k: "0", v: "Manual busywork" },
           { k: "24/7", v: "Agent always working" },
         ].map((s) => (
-          <div key={s.v} className="bg-[#18181B] border border-zinc-800 rounded-md p-5 text-center">
-            <div className="font-display text-3xl font-black text-cyan-400">{s.k}</div>
-            <p className="text-xs text-zinc-500 mt-1">{s.v}</p>
+          <div key={s.v} className="bg-[#18181B] border border-zinc-800 rounded-md p-5 text-center overflow-hidden">
+            <div className="text-3xl font-black text-cyan-400 leading-none">{s.k}</div>
+            <p className="text-xs text-zinc-400 mt-1">{s.v}</p>
           </div>
         ))}
       </section>
@@ -143,7 +143,7 @@ export default function Landing() {
         <div className="grid md:grid-cols-3 gap-4">
           {steps.map((s) => (
             <div key={s.n} className="relative bg-[#18181B] border border-zinc-800 rounded-md p-6">
-              <div className="font-display text-5xl font-black text-zinc-800">{s.n}</div>
+              <div aria-hidden="true" className="font-display text-5xl font-black text-zinc-500">{s.n}</div>
               <h3 className="font-display font-semibold text-lg mt-3">{s.title}</h3>
               <p className="text-sm text-zinc-400 mt-2 leading-relaxed">{s.desc}</p>
             </div>
@@ -174,7 +174,7 @@ export default function Landing() {
               </div>
               <div className="mt-4 flex items-baseline gap-1">
                 <span className="font-display text-4xl font-black">{p.price}</span>
-                {p.per && <span className="text-zinc-500 text-sm">{p.per}</span>}
+                {p.per && <span className="text-zinc-400 text-sm">{p.per}</span>}
               </div>
               <ul className="mt-6 space-y-2.5">
                 {p.features.map((f) => (
@@ -194,7 +194,7 @@ export default function Landing() {
             </div>
           ))}
         </div>
-        <p className="text-center text-xs text-zinc-600 mt-6">No card required to start on Starter — upgrade any time from Billing.</p>
+        <p className="text-center text-xs text-zinc-400 mt-6">No card required to start on Starter — upgrade any time from Billing.</p>
       </section>
 
       {/* CTA */}
@@ -222,7 +222,7 @@ export default function Landing() {
             <Radar className="w-5 h-5 text-cyan-400" />
             <span className="font-display font-bold">OutreachPilot</span>
           </div>
-          <p className="text-xs text-zinc-600">© {new Date().getFullYear()} OutreachPilot. Autonomous cold outreach.</p>
+          <p className="text-xs text-zinc-400">© {new Date().getFullYear()} OutreachPilot. Autonomous cold outreach.</p>
         </div>
       </footer>
     </div>
