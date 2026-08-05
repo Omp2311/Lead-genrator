@@ -1,0 +1,5 @@
+INFO:     Started server process [1012]
+INFO:     Waiting for application startup.
+2026-08-05 23:45:02,029 - outreachpilot - INFO - OutreachPilot started
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
