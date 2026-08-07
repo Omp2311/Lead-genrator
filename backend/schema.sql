@@ -177,6 +177,10 @@ ALTER TABLE settings ADD COLUMN IF NOT EXISTS brand_logo_url TEXT NOT NULL DEFAU
 ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT UNIQUE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by UUID REFERENCES users(id) ON DELETE SET NULL;
 
+-- Tier 5: user-supplied real results/testimonials the AI may cite in follow-ups instead of
+-- inventing statistics — each entry is a short, factual claim the user vouches for themselves.
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS proof_points TEXT[] NOT NULL DEFAULT '{}';
+
 -- Tier 5: public API keys, for Zapier/Make-style generic webhook/HTTP integrations.
 CREATE TABLE IF NOT EXISTS api_keys (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -144,6 +144,19 @@ export default function Profile() {
               className="mt-1 w-full bg-[#0f0f11] border border-zinc-800 rounded-sm px-3 py-2 text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none transition-colors resize-none"
             />
           </div>
+          <div>
+            <TagInput
+              label="Proof points / real results (optional)"
+              values={s.proof_points || []}
+              onChange={(v) => set("proof_points", v)}
+              testid="profile-proof-points-input"
+              placeholder="e.g. Built a dashboard that cut support tickets 30% for a SaaS client — Enter to add"
+            />
+            <p className="text-xs text-zinc-500 mt-1">
+              Only add results you can personally vouch for. Follow-up emails may quote one of these
+              verbatim; with none provided, the AI will not claim any stats or past results at all.
+            </p>
+          </div>
         </div>
 
         <div className="bg-[#18181B] border border-zinc-800 rounded-md p-6 space-y-5">

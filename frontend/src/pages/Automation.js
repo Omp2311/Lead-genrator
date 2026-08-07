@@ -294,10 +294,11 @@ export default function Automation() {
         offer: s.offer,
         tone: s.tone,
       });
-      const mode = r.data.email_live && r.data.lead_source === "apollo" ? "delivered" : "drafted (demo)";
+      const isReal = ["apollo", "places_hunter", "csv"].includes(r.data.lead_source);
+      const mode = r.data.email_live && isReal ? "delivered" : "drafted (demo)";
       toast.success(`${r.data.leads} leads · ${r.data.emails} emails ${mode}`);
     } catch (e) {
-      toast.error("Run failed.");
+      toast.error(formatApiErrorDetail(e?.response?.data?.detail) || "Run failed.");
     } finally {
       setRunning(false);
     }

@@ -70,6 +70,8 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "").replace(" ", "").strip()
 IMAP_HOST = os.environ.get("IMAP_HOST", "imap.gmail.com").strip()
 IMAP_PORT = int(os.environ.get("IMAP_PORT", "993") or 993)
 APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY", "").strip()
+HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "").strip()
+GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()
@@ -94,6 +96,7 @@ PLAN_LIMITS = {
 VOICE_NOTES_DIR = ROOT_DIR / "voice_notes"
 
 _apollo_ok = None  # None=untested, True=working, False=blocked (e.g. free plan)
+_places_hunter_ok = None  # None=untested, True=working, False=blocked
 
 def _email_configured() -> bool:
     return bool((SMTP_HOST and SMTP_USER and SMTP_PASSWORD) or RESEND_API_KEY)
@@ -119,6 +122,8 @@ async def integrations_status(user_id: str = None) -> dict:
         "inboxes_configured": inbox_count,
         "leads_live": bool(APOLLO_API_KEY) and _apollo_ok is not False,
         "leads_blocked": bool(APOLLO_API_KEY) and _apollo_ok is False,
+        "places_hunter_live": bool(HUNTER_API_KEY and GOOGLE_PLACES_API_KEY) and _places_hunter_ok is not False,
+        "places_hunter_blocked": bool(HUNTER_API_KEY and GOOGLE_PLACES_API_KEY) and _places_hunter_ok is False,
         "whatsapp_live": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM),
         "reply_detection_live": bool(SMTP_USER and SMTP_PASSWORD),
     }
@@ -228,6 +233,7 @@ class RunInput(BaseModel):
     industry: Optional[str] = None
     offer: Optional[str] = None
     tone: Optional[str] = None
+    allow_demo: bool = False
 
 class SettingsInput(BaseModel):
     daily_target: int = 100
@@ -243,6 +249,7 @@ class SettingsInput(BaseModel):
     meeting_link: str = ""
     brand_name: str = ""
     brand_logo_url: str = ""
+    proof_points: List[str] = []
 
 class EmailUpdate(BaseModel):
     to_email: Optional[str] = None
@@ -314,6 +321,27 @@ def _extract_json(text: str):
     start = min([i for i in [text.find("["), text.find("{")] if i != -1], default=0)
     return json.loads(text[start:])
 
+# Some providers occasionally mis-encode smart quotes/dashes as U+FFFD when generating
+# copy (e.g. "Let�s schedule..."), which reaches recipients as a broken character.
+# Normalize those to plain ASCII before any generated text is stored or sent.
+_TEXT_CLEANUP = {
+    "�": "'", "‘": "'", "’": "'",
+    "“": '"', "”": '"', "–": "-", "—": "-",
+}
+
+def clean_copy(value):
+    if not isinstance(value, str):
+        return value
+    for bad, good in _TEXT_CLEANUP.items():
+        value = value.replace(bad, good)
+    return value
+
+def clean_copy_fields(item: dict, keys) -> dict:
+    for k in keys:
+        if k in item and item[k] is not None:
+            item[k] = clean_copy(item[k])
+    return item
+
 async def _call_anthropic(system: str, prompt: str) -> str:
     resp = await anthropic_client.messages.create(
         model=ANTHROPIC_MODEL, max_tokens=4096, system=system,
@@ -361,11 +389,19 @@ Return a JSON array. Each item MUST have keys:
 "company", "contact_name", "title", "email" (plausible corporate email),
 "phone" (E.164 with country code, or empty string for ~30% of them),
 "location", "industry", "website", "pain_point" (1 short sentence specific to them),
-"project_idea" (1 sentence: a concrete project the sender could build for them using their skills),
-"estimated_value" (a realistic project budget range in USD, e.g. "$4k–$8k").
+"project_idea" (1 sentence: a concrete project the sender could build for them, using ONLY
+the skill(s) from the sender's list that are genuinely appropriate for that specific type of
+work — never misuse a skill's category, e.g. Django/FastAPI/Node.js are backend web frameworks,
+NOT CI/CD tools, and React is a frontend library, NOT a database. If no listed skill fits the
+pain_point well, pick the closest realistic one rather than forcing a mismatch),
+"estimated_value" (a realistic project budget range in USD, e.g. "$4k-$8k").
+Use plain straight quotes/apostrophes and hyphens only — no smart quotes or em-dashes.
 Return ONLY the JSON array, no prose."""
     raw = await llm_call(system, prompt)
-    return _extract_json(raw)
+    leads = _extract_json(raw)
+    text_keys = ["company", "contact_name", "title", "location", "industry", "website",
+                 "pain_point", "project_idea", "estimated_value"]
+    return [clean_copy_fields(l, text_keys) for l in leads]
 
 def subject_variant(idx: int) -> str:
     """Alternates two subject-line styles across a batch so open rates can be A/B compared."""
@@ -393,18 +429,34 @@ Rules: <=120 words, one clear CTA (a 15-min call), reference their pain_point na
 and pitch the specific "project_idea" as what you could build for them. If "live_signal" is
 non-empty for a prospect, it's a real, current snippet pulled from their own website — weave
 in one specific detail from it naturally if it fits; ignore it if it doesn't add anything
-concrete. No fluff, no "I hope this finds you well". Subject line <=6 words, matching each
+concrete. No fluff, no "I hope this finds you well", no clickbait subject lines, and never
+invent statistics, client results, or case studies that weren't given to you — the only claims
+you can make are the pain_point and project_idea provided. Use plain straight quotes/apostrophes
+and hyphens only — no smart quotes or em-dashes. Subject line <=6 words, matching each
 prospect's "subject_style".{meeting_note}
 Prospects: {json.dumps(compact)}
 Return a JSON array where each item has: "i" (matching index), "subject", "body".
 Body should use \\n for line breaks and end with "{sender}". Return ONLY JSON."""
     raw = await llm_call(system, prompt)
-    return _extract_json(raw)
+    emails = _extract_json(raw)
+    return [clean_copy_fields(e, ["subject", "body"]) for e in emails]
 
-def whatsapp_link(phone: str, company: str, sender: str, offer: str) -> str:
+def build_whatsapp_message(lead: dict, sender: str, offer: str) -> str:
+    """Personalized WhatsApp opener — mirrors the email's use of pain_point/project_idea
+    instead of a generic mass-blast line, so it reads as researched rather than templated."""
+    first_name = (lead.get("contact_name") or "").strip().split(" ")[0] or "there"
+    company = (lead.get("company") or "your team").strip()
+    project_idea = (lead.get("project_idea") or "").strip().rstrip(".")
+    if project_idea:
+        pitch = f"I put together a quick idea for {company}: {project_idea}"
+    else:
+        pitch = f"I put together a quick proposal for {company} on {offer}"
+    msg = f"Hi {first_name}, this is {sender}. {pitch}. Do you have 2 minutes for a quick call?"
+    return clean_copy(msg)
+
+def whatsapp_link(phone: str, lead: dict, sender: str, offer: str) -> str:
     digits = "".join(c for c in phone if c.isdigit())
-    msg = (f"Hi, this is {sender}. I came across {company} and put together a quick "
-           f"proposal on how we can help with {offer}. Do you have 2 minutes?")
+    msg = build_whatsapp_message(lead, sender, offer)
     return f"https://wa.me/{digits}?text={quote(msg)}"
 
 
@@ -681,16 +733,129 @@ async def fetch_apollo_leads(regions, industries, count) -> List[dict]:
         })
     return [l for l in leads if l["email"]]
 
-async def source_leads(settings: dict, count: int, region=None, industry=None):
+
+# ---------------------------------------------------------------------------
+# Real lead sourcing via Google Places (discovers real companies) + Hunter.io
+# (finds real, verified emails at those companies' domains). Second real
+# source, independent of Apollo — useful when Apollo access is blocked.
+# ---------------------------------------------------------------------------
+def _domain_from_url(url: str) -> str:
+    from urllib.parse import urlparse
+    netloc = urlparse(url if url.startswith("http") else f"https://{url}").netloc
+    return netloc[4:] if netloc.startswith("www.") else netloc
+
+async def fetch_places_companies(regions, industries, limit) -> List[dict]:
+    """Real local businesses via Google Places Text Search + Place Details."""
+    companies = []
+    async with httpx.AsyncClient(timeout=20) as c:
+        for region in regions:
+            for industry in industries:
+                if len(companies) >= limit:
+                    break
+                resp = await c.get("https://maps.googleapis.com/maps/api/place/textsearch/json",
+                                   params={"query": f"{industry} companies in {region}",
+                                           "key": GOOGLE_PLACES_API_KEY})
+                if resp.is_error:
+                    raise RuntimeError(f"Google Places error {resp.status_code}")
+                data = resp.json()
+                status = data.get("status")
+                if status not in ("OK", "ZERO_RESULTS"):
+                    raise RuntimeError(f"Google Places status {status}: {data.get('error_message', '')}")
+                for place in data.get("results", []):
+                    place_id = place.get("place_id")
+                    if not place_id:
+                        continue
+                    det = await c.get("https://maps.googleapis.com/maps/api/place/details/json",
+                                      params={"place_id": place_id,
+                                              "fields": "name,website,formatted_phone_number,"
+                                                        "international_phone_number,formatted_address",
+                                              "key": GOOGLE_PLACES_API_KEY})
+                    if det.is_error:
+                        continue
+                    d = det.json().get("result", {})
+                    website = d.get("website")
+                    if not website:
+                        continue  # no domain to look up real contacts at — skip
+                    companies.append({
+                        "company": d.get("name") or place.get("name") or "",
+                        "website": website,
+                        "phone": d.get("international_phone_number") or d.get("formatted_phone_number") or "",
+                        "location": d.get("formatted_address") or region,
+                        "industry": industry,
+                    })
+    return companies
+
+async def fetch_hunter_contact(domain: str) -> Optional[dict]:
+    """Real, verified email + name/title at a domain, via Hunter's Domain Search."""
+    async with httpx.AsyncClient(timeout=20) as c:
+        resp = await c.get("https://api.hunter.io/v2/domain-search",
+                           params={"domain": domain, "api_key": HUNTER_API_KEY, "limit": 5})
+    if resp.is_error:
+        if resp.status_code in (401, 403):
+            raise RuntimeError(f"Hunter auth error {resp.status_code}")
+        return None
+    emails = (resp.json().get("data") or {}).get("emails") or []
+    decision_maker_titles = ("ceo", "founder", "cto", "director", "head", "vp", "manager", "owner")
+    emails.sort(key=lambda e: 0 if (e.get("position") or "").lower().startswith(decision_maker_titles) else 1)
+    for e in emails:
+        if e.get("value"):
+            return {"email": e["value"],
+                    "contact_name": " ".join(x for x in [e.get("first_name"), e.get("last_name")] if x),
+                    "title": e.get("position") or ""}
+    return None
+
+async def fetch_places_hunter_leads(regions, industries, count) -> List[dict]:
+    global _places_hunter_ok
+    companies = await fetch_places_companies(regions, industries, count * 4)
+    leads = []
+    for comp in companies:
+        if len(leads) >= count:
+            break
+        domain = _domain_from_url(comp["website"])
+        try:
+            contact = await fetch_hunter_contact(domain)
+        except Exception as e:
+            logger.warning(f"Hunter lookup failed for {domain}: {e}")
+            continue
+        if not contact:
+            continue
+        leads.append({
+            "company": comp["company"], "contact_name": contact["contact_name"],
+            "title": contact["title"], "email": contact["email"], "phone": comp.get("phone", ""),
+            "location": comp.get("location", ""), "industry": comp.get("industry", ""),
+            "website": comp["website"], "pain_point": "",
+        })
+    _places_hunter_ok = True
+    return leads
+
+async def source_leads(settings: dict, count: int, region=None, industry=None, allow_demo: bool = False):
     regions = [region] if region else settings.get("regions", ["Dubai, UAE", "United States"])
     industries = [industry] if industry else settings.get("industries", ["SaaS", "IT Services"])
+    errors = []
     if APOLLO_API_KEY:
         try:
             leads = await fetch_apollo_leads(regions, industries, count)
             if leads:
                 return leads, "apollo"
+            errors.append("Apollo returned no matching people for your current filters.")
         except Exception as e:
-            logger.error(f"Apollo failed, using AI leads: {e}")
+            logger.error(f"Apollo failed: {e}")
+            errors.append(f"Apollo: {e}")
+    if HUNTER_API_KEY and GOOGLE_PLACES_API_KEY:
+        try:
+            leads = await fetch_places_hunter_leads(regions, industries, count)
+            if leads:
+                return leads, "places_hunter"
+            errors.append("Google Places + Hunter found no matching companies for your current filters.")
+        except Exception as e:
+            logger.error(f"Places/Hunter failed: {e}")
+            errors.append(f"Places/Hunter: {e}")
+    if not allow_demo:
+        raise RuntimeError(
+            "No real lead source is available — " +
+            (" ".join(errors) if errors else "No lead integrations are connected.") +
+            " Import a CSV of real contacts, or fix your integration access, instead of using demo data."
+        )
     ai = await generate_leads(settings, count, region, industry)
     return ai, "ai"
 
@@ -731,7 +896,9 @@ async def attach_live_signals(leads: List[dict]) -> List[dict]:
 
 DEFAULT_SEQUENCE_STEPS = [
     {"step_order": 1, "delay_days": 3,
-     "angle": "Nudge: reference the first email lightly, add one new angle/proof point, <=70 words."},
+     "angle": "Nudge: reference the first email lightly, then add one new angle — a verified proof "
+              "point if one was provided, otherwise a specific detail on the project_idea or the "
+              "cost of leaving the pain_point unaddressed. <=70 words."},
     {"step_order": 2, "delay_days": 6,
      "angle": "Breakup: short, friendly last touch, create urgency without pressure, <=55 words."},
 ]
@@ -762,35 +929,50 @@ async def generate_followups(settings: dict, leads: List[dict], steps: List[dict
                 "industry": l.get("industry")} for idx, l in enumerate(leads)]
     steps_desc = "\n".join(f'Follow-up #{i + 1}: {s.get("angle") or "brief, polite follow-up"}'
                            for i, s in enumerate(steps))
+    proof_points = [p.strip() for p in (settings.get("proof_points") or []) if p.strip()]
+    if proof_points:
+        proof_rule = ("You may cite AT MOST ONE of these real, user-verified results if one fits "
+                      "naturally — quote it accurately, do not alter numbers or add embellishment:\n"
+                      + "\n".join(f"- {p}" for p in proof_points))
+    else:
+        proof_rule = "No verified results have been provided — do not cite any statistics or results at all."
     prompt = f"""For each prospect, write ONE short follow-up email per step below (they didn't reply
 to the earlier email(s) in the sequence).
 Sender: {sender}. Offer: {offer}.
 {steps_desc}
+{proof_rule}
+Never invent statistics, client results, or case studies beyond what's listed above — the only
+claims you can make are the pain_point, title, and industry given below, plus the verified result(s)
+above if any were given. Use plain straight quotes/apostrophes and hyphens only — no smart quotes
+or em-dashes.
 All end with "{sender}". Subjects <=5 words, can start with "Re:".
 Prospects: {json.dumps(compact)}
 Return a JSON array where each item is {{"i": <index>, "followups": [{{"subject","body"}}, ...]}}
 with exactly {len(steps)} followup(s) per prospect, in the same order as the steps above.
 Return ONLY JSON."""
     raw = await llm_call(system, prompt)
-    return _extract_json(raw)
+    results = _extract_json(raw)
+    for r in results:
+        r["followups"] = [clean_copy_fields(f, ["subject", "body"]) for f in r.get("followups", [])]
+    return results
 
 
 # ---------------------------------------------------------------------------
 # Core automation run
 # ---------------------------------------------------------------------------
 async def execute_run(user_id: str, count: int, region=None, industry=None,
-                      offer=None, tone=None, source="manual"):
+                      offer=None, tone=None, source="manual", allow_demo: bool = False):
     settings = await get_or_create_settings(user_id)
     if offer:
         settings = {**settings, "offer": offer}
     if tone:
         settings = {**settings, "tone": tone}
 
-    leads, lead_source = await source_leads(settings, count, region, industry)
+    leads, lead_source = await source_leads(settings, count, region, industry, allow_demo=allow_demo)
     leads = await attach_live_signals(leads)
     has_inbox = bool(await pool.fetchval(
         "SELECT count(*) FROM inboxes WHERE user_id=$1 AND is_active=true", user_id))
-    deliver = (_email_configured() or has_inbox) and lead_source == "apollo"
+    deliver = (_email_configured() or has_inbox) and lead_source != "ai"
     emails = await generate_emails(settings, leads)
     email_by_i = {e.get("i"): e for e in emails}
     steps = await get_sequence_steps(user_id)
@@ -813,8 +995,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
         phone = (lead.get("phone") or "").strip()
         to_email = lead.get("email", "")
         suppressed_lead = await is_suppressed(user_id, to_email) if to_email else False
-        wa = whatsapp_link(phone, lead.get("company", ""), sender,
-                           settings.get("offer", "")) if phone else None
+        wa = whatsapp_link(phone, lead, sender, settings.get("offer", "")) if phone else None
         await pool.execute("""
             INSERT INTO leads (id, user_id, company, contact_name, title, email, phone, location,
                                 industry, website, pain_point, project_idea, estimated_value,
@@ -859,10 +1040,8 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
 
         # WhatsApp proposal
         if wa:
-            wa_body = (f"Hi {lead.get('contact_name','').split(' ')[0]}, this is {sender}. "
-                       f"I put together a quick proposal for {lead.get('company','')} on "
-                       f"{settings.get('offer','')}. Do you have 2 minutes?")
-            wa_res = await send_whatsapp(phone, wa_body, allow=(lead_source == "apollo"))
+            wa_body = build_whatsapp_message(lead, sender, settings.get("offer", ""))
+            wa_res = await send_whatsapp(phone, wa_body, allow=(lead_source != "ai"))
             if wa_res["status"] == "sent" and not wa_res.get("simulated"):
                 wa_sent += 1
             await pool.execute("""
@@ -875,7 +1054,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
                  wa_res.get("simulated", False), wa_res.get("error"), wa, now_dt,
                  now_dt if wa_res["status"] == "sent" else None)
 
-    src_label = "Apollo" if lead_source == "apollo" else "AI"
+    src_label = {"apollo": "Apollo", "places_hunter": "Google Places + Hunter", "csv": "CSV"}.get(lead_source, "AI")
     await pool.execute("""
         INSERT INTO activity (id, user_id, type, message, created_at)
         VALUES ($1,$2,$3,$4,$5)
@@ -886,6 +1065,94 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
     return {"leads": created_leads, "emails": created_emails, "run_at": now_dt.isoformat(),
             "real_sent": real_sent, "whatsapp_sent": wa_sent, "lead_source": lead_source,
             "email_live": _email_configured()}
+
+
+async def draft_emails_for_leads(user_id: str) -> dict:
+    """Generate an initial email, follow-up sequence, and WhatsApp message for leads that
+    already exist (e.g. CSV-imported) but don't have an initial email drafted yet."""
+    settings = await get_or_create_settings(user_id)
+    leads = recs(await pool.fetch("""
+        SELECT * FROM leads WHERE user_id=$1 AND id NOT IN (
+            SELECT lead_id FROM emails WHERE user_id=$1 AND type='initial' AND lead_id IS NOT NULL
+        )
+    """, user_id))
+    if not leads:
+        return {"drafted": 0, "whatsapp_sent": 0}
+
+    has_inbox = bool(await pool.fetchval(
+        "SELECT count(*) FROM inboxes WHERE user_id=$1 AND is_active=true", user_id))
+    emails = await generate_emails(settings, leads)
+    email_by_i = {e.get("i"): e for e in emails}
+    steps = await get_sequence_steps(user_id)
+    try:
+        fups = await generate_followups(settings, leads, steps)
+        fups_by_i = {f.get("i"): (f.get("followups") or []) for f in fups}
+    except Exception as e:
+        logger.error(f"Follow-up generation failed: {e}")
+        fups_by_i = {}
+
+    now_dt = datetime.now(timezone.utc)
+    sender = settings.get("sender_name", "Alex")
+    drafted = 0
+    wa_sent = 0
+
+    for idx, lead in enumerate(leads):
+        lead_id = lead["id"]
+        lead_source = lead.get("lead_source") or "csv"
+        deliver = (_email_configured() or has_inbox) and lead_source != "ai"
+        to_email = lead.get("email", "")
+        phone = (lead.get("phone") or "").strip()
+        suppressed_lead = await is_suppressed(user_id, to_email) if to_email else False
+
+        em = email_by_i.get(idx, {})
+        subject = em.get("subject", "Quick question")
+        body = em.get("body", "")
+        await pool.execute("""
+            INSERT INTO emails (id, user_id, lead_id, company, contact_name, to_email, subject, body,
+                                 channel, step, type, status, simulated, error, created_at,
+                                 deliverable, lead_source, sent_at, variant)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'email',1,'initial',$9,false,NULL,$10,$11,$12,NULL,$13)
+        """, str(uuid.uuid4()), user_id, lead_id, lead.get("company", ""),
+             lead.get("contact_name", ""), to_email, subject, body,
+             "suppressed" if suppressed_lead else "draft", now_dt, deliver, lead_source,
+             subject_variant(idx))
+        drafted += 1
+
+        if not suppressed_lead:
+            for step_i, fu in enumerate(fups_by_i.get(idx, [])[:len(steps)]):
+                delay = steps[step_i]["delay_days"] if step_i < len(steps) else 6
+                scheduled_for = now_dt + timedelta(days=delay)
+                await pool.execute("""
+                    INSERT INTO emails (id, user_id, lead_id, company, contact_name, to_email, subject, body,
+                                         channel, step, type, status, simulated, error, created_at, sent_at,
+                                         deliverable, lead_source, scheduled_for)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'email',$9,'follow_up','scheduled',false,NULL,$10,NULL,$11,$12,$13)
+                """, str(uuid.uuid4()), user_id, lead_id, lead.get("company", ""),
+                     lead.get("contact_name", ""), to_email, fu.get("subject", "Re: quick follow-up"),
+                     fu.get("body", ""), step_i + 2, now_dt, deliver, lead_source, scheduled_for)
+
+        if phone:
+            wa = whatsapp_link(phone, lead, sender, settings.get("offer", ""))
+            wa_body = build_whatsapp_message(lead, sender, settings.get("offer", ""))
+            wa_res = await send_whatsapp(phone, wa_body, allow=(lead_source != "ai"))
+            if wa_res["status"] == "sent" and not wa_res.get("simulated"):
+                wa_sent += 1
+            await pool.execute("""
+                INSERT INTO emails (id, user_id, lead_id, company, contact_name, to_email, subject, body,
+                                     channel, step, type, status, simulated, error, whatsapp_link,
+                                     created_at, sent_at)
+                VALUES ($1,$2,$3,$4,$5,$6,'WhatsApp proposal',$7,'whatsapp',1,'initial',$8,$9,$10,$11,$12,$13)
+            """, str(uuid.uuid4()), user_id, lead_id, lead.get("company", ""),
+                 lead.get("contact_name", ""), phone, wa_body, wa_res["status"],
+                 wa_res.get("simulated", False), wa_res.get("error"), wa, now_dt,
+                 now_dt if wa_res["status"] == "sent" else None)
+            await pool.execute("UPDATE leads SET whatsapp_link=$1 WHERE id=$2", wa, lead_id)
+
+    await pool.execute("""
+        INSERT INTO activity (id, user_id, type, message, created_at)
+        VALUES ($1,$2,'manual',$3,$4)
+    """, str(uuid.uuid4()), user_id, f"Drafted emails for {drafted} imported lead(s).", now_dt)
+    return {"drafted": drafted, "whatsapp_sent": wa_sent}
 
 
 async def process_due_followups(user_id: str = None) -> int:
@@ -1275,7 +1542,11 @@ async def test_email(user: dict = Depends(get_current_user)):
 @api_router.post("/automation/run")
 async def run_now(data: RunInput, user: dict = Depends(get_current_user)):
     count = max(1, min(data.count, 15))
-    result = await execute_run(tenant_id(user), count, data.region, data.industry, data.offer, data.tone)
+    try:
+        result = await execute_run(tenant_id(user), count, data.region, data.industry, data.offer,
+                                   data.tone, allow_demo=data.allow_demo)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     await pool.execute("UPDATE settings SET last_run=$1 WHERE user_id=$2",
                        datetime.fromisoformat(result["run_at"]), tenant_id(user))
     return result
@@ -1380,12 +1651,20 @@ async def get_voice_note(email_id: str):
 async def _send_one_email(em: dict, user_id: str) -> dict:
     """Manual send always attempts real delivery to the address shown."""
     to_email = (em.get("to_email") or "").strip()
+    inbox = None
     if not to_email:
-        return {"status": "failed", "error": "No recipient", "simulated": False}
-    inbox = await pick_inbox(user_id)
-    cfg = _inbox_to_cfg(inbox) if inbox else None
-    result = await send_email(to_email, em.get("subject", ""), em.get("body", ""), allow=True,
-                              user_id=user_id, email_id=em["id"], cfg=cfg)
+        result = {"status": "failed", "error": "No recipient", "simulated": False}
+    elif em.get("lead_source") == "ai":
+        result = {"status": "failed", "simulated": False,
+                  "error": ("This lead was AI-generated for demo purposes and is not a real, "
+                            "contactable person — sending would likely bounce or reach an unrelated "
+                            "business. Connect Apollo (Settings > Integrations) or import a CSV of "
+                            "real contacts to send to actual prospects.")}
+    else:
+        inbox = await pick_inbox(user_id)
+        cfg = _inbox_to_cfg(inbox) if inbox else None
+        result = await send_email(to_email, em.get("subject", ""), em.get("body", ""), allow=True,
+                                  user_id=user_id, email_id=em["id"], cfg=cfg)
     now = datetime.now(timezone.utc)
     await pool.execute(
         "UPDATE emails SET status=$1, simulated=$2, error=$3, sent_at=$4, inbox_id=$5 WHERE id=$6",
@@ -1472,12 +1751,12 @@ async def update_settings(data: SettingsInput, user: dict = Depends(get_current_
     await pool.execute("""
         UPDATE settings SET daily_target=$1, auto_enabled=$2, regions=$3, industries=$4, offer=$5,
                             sender_name=$6, tone=$7, skills=$8, headline=$9, experience=$10, meeting_link=$11,
-                            brand_name=$12, brand_logo_url=$13
-        WHERE user_id=$14
+                            brand_name=$12, brand_logo_url=$13, proof_points=$14
+        WHERE user_id=$15
     """, payload["daily_target"], payload["auto_enabled"], payload["regions"], payload["industries"],
          payload["offer"], payload["sender_name"], payload["tone"], payload["skills"],
          payload["headline"], payload["experience"], payload["meeting_link"],
-         payload["brand_name"], payload["brand_logo_url"], tid)
+         payload["brand_name"], payload["brand_logo_url"], payload["proof_points"], tid)
     return await get_or_create_settings(tid)
 
 
@@ -1541,8 +1820,23 @@ async def import_leads(file: UploadFile = File(...), user: dict = Depends(get_cu
     now_dt = datetime.now(timezone.utc)
     imported = 0
     skipped = 0
+    enriched = 0
     for row in reader:
         email = (row.get("email") or "").strip().lower()
+        website = (row.get("website") or "").strip()
+        if not email and website and HUNTER_API_KEY:
+            # No email given, but we have a domain — look up a real, verified one via Hunter
+            # instead of skipping the row (uses your Hunter credits, not Google Places).
+            try:
+                contact = await fetch_hunter_contact(_domain_from_url(website))
+            except Exception as e:
+                logger.warning(f"Hunter lookup failed during import for {website}: {e}")
+                contact = None
+            if contact and contact.get("email"):
+                email = contact["email"].strip().lower()
+                row = {**row, "contact_name": row.get("contact_name") or contact.get("contact_name", ""),
+                       "title": row.get("title") or contact.get("title", "")}
+                enriched += 1
         if not email:
             skipped += 1
             continue
@@ -1552,7 +1846,7 @@ async def import_leads(file: UploadFile = File(...), user: dict = Depends(get_cu
             skipped += 1
             continue
         phone = (row.get("phone") or "").strip()
-        wa = whatsapp_link(phone, row.get("company", ""), sender, offer) if phone else None
+        wa = whatsapp_link(phone, row, sender, offer) if phone else None
         suppressed_lead = await is_suppressed(tenant_id(user), email)
         await pool.execute("""
             INSERT INTO leads (id, user_id, company, contact_name, title, email, phone, location,
@@ -1568,8 +1862,15 @@ async def import_leads(file: UploadFile = File(...), user: dict = Depends(get_cu
         INSERT INTO activity (id, user_id, type, message, created_at)
         VALUES ($1,$2,'manual',$3,$4)
     """, str(uuid.uuid4()), tenant_id(user),
-         f"Imported {imported} lead(s) from CSV ({skipped} skipped — missing email or duplicate).", now_dt)
-    return {"imported": imported, "skipped": skipped}
+         (f"Imported {imported} lead(s) from CSV ({skipped} skipped — missing email or duplicate; "
+          f"{enriched} email(s) found via Hunter)."), now_dt)
+    return {"imported": imported, "skipped": skipped, "enriched_via_hunter": enriched}
+
+@api_router.post("/leads/draft-missing")
+async def draft_missing_leads(user: dict = Depends(get_current_user)):
+    """Generate cold email + follow-ups + WhatsApp for existing leads with no draft yet —
+    the step CSV-imported (or otherwise manually-added) leads need before they can be sent."""
+    return await draft_emails_for_leads(tenant_id(user))
 
 
 # ---------------------------------------------------------------------------

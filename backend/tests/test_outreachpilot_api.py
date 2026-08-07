@@ -158,7 +158,7 @@ class TestAutomationRun:
     def _run_once(self, s):
         if TestAutomationRun._did_run:
             return
-        r = s.post(f"{BASE_URL}/api/automation/run", json={"count": 3}, timeout=180)
+        r = s.post(f"{BASE_URL}/api/automation/run", json={"count": 3, "allow_demo": True}, timeout=180)
         assert r.status_code == 200, r.text
         d = r.json()
         assert d["leads"] >= 1

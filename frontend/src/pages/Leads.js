@@ -175,6 +175,7 @@ function LeadCard({ l, i, onMarkReplied }) {
 export default function Leads() {
   const [leads, setLeads] = useState(null);
   const [importing, setImporting] = useState(false);
+  const [drafting, setDrafting] = useState(false);
   const fileInputRef = useRef(null);
 
   const load = () => api.get("/leads").then((res) => setLeads(res.data)).catch(() => setLeads([]));
@@ -204,12 +205,31 @@ export default function Leads() {
       const r = await api.post("/leads/import", formData, {
         headers: { "Content-Type": "multipart/form-data" },
       });
-      toast.success(`Imported ${r.data.imported} lead(s) · ${r.data.skipped} skipped`);
+      const hunterNote = r.data.enriched_via_hunter > 0 ? ` · ${r.data.enriched_via_hunter} email(s) found via Hunter` : "";
+      toast.success(`Imported ${r.data.imported} lead(s) · ${r.data.skipped} skipped${hunterNote}`);
       load();
+      if (r.data.imported > 0) await draftMissing();
     } catch (e) {
       toast.error(formatApiErrorDetail(e?.response?.data?.detail) || "Import failed.");
     } finally {
       setImporting(false);
+    }
+  };
+
+  const draftMissing = async () => {
+    setDrafting(true);
+    try {
+      const r = await api.post("/leads/draft-missing");
+      if (r.data.drafted > 0) {
+        toast.success(`Drafted emails for ${r.data.drafted} lead(s) — check the Outbox.`);
+      } else {
+        toast.info("Every lead already has a draft.");
+      }
+      load();
+    } catch (e) {
+      toast.error(formatApiErrorDetail(e?.response?.data?.detail) || "Could not draft emails.");
+    } finally {
+      setDrafting(false);
     }
   };
 
@@ -241,6 +261,16 @@ export default function Leads() {
             Import CSV
           </button>
           <input ref={fileInputRef} type="file" accept=".csv" onChange={handleFileChange} className="hidden" data-testid="import-csv-input" />
+          <button
+            onClick={draftMissing}
+            disabled={drafting}
+            data-testid="draft-missing-emails-button"
+            className="flex items-center gap-2 text-sm bg-zinc-800 text-white px-4 py-2 rounded-sm hover:bg-zinc-700 transition-colors disabled:opacity-60"
+            title="Generate cold email + follow-ups + WhatsApp for any lead that doesn't have a draft yet"
+          >
+            {drafting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Mail className="w-4 h-4" />}
+            Draft emails for new leads
+          </button>
         </div>
       </div>
 
