@@ -205,6 +205,17 @@ export default function Profile() {
               />
               <p className="text-xs text-zinc-500 mt-1">If set, the AI may offer it as a direct way to book time instead of proposing a call.</p>
             </div>
+            <div className="sm:col-span-2">
+              <label className="text-xs uppercase tracking-wider text-zinc-500">LinkedIn profile (optional)</label>
+              <input
+                data-testid="profile-linkedin-url-input"
+                value={s.linkedin_url || ""}
+                onChange={(e) => set("linkedin_url", e.target.value)}
+                placeholder="e.g. https://www.linkedin.com/in/yourname"
+                className="mt-1 w-full bg-[#0f0f11] border border-zinc-800 rounded-sm px-3 py-2 text-sm font-mono focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none transition-colors"
+              />
+              <p className="text-xs text-zinc-500 mt-1">If set, the first email to a lead may include it as a way to verify your background.</p>
+            </div>
           </div>
         </div>
 

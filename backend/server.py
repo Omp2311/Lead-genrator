@@ -284,6 +284,7 @@ class SettingsInput(BaseModel):
     brand_name: str = ""
     brand_logo_url: str = ""
     proof_points: List[str] = []
+    linkedin_url: str = ""
 
 class EmailUpdate(BaseModel):
     to_email: Optional[str] = None
@@ -376,6 +377,21 @@ def clean_copy_fields(item: dict, keys) -> dict:
             item[k] = clean_copy(item[k])
     return item
 
+def _enforce_word_limit(body: str, sender: str, limit: int) -> str:
+    """Backstop for the word-limit rules given in the prompt — LLMs don't always comply,
+    so this guarantees it rather than trusting instruction-following alone."""
+    words = body.split()
+    if len(words) <= limit:
+        return body
+    logger.warning(f"Generated email exceeded {limit}-word limit ({len(words)} words) — truncating")
+    truncated = " ".join(words[:limit])
+    cut = max(truncated.rfind(". "), truncated.rfind("! "), truncated.rfind("? "))
+    if cut > len(truncated) * 0.5:
+        truncated = truncated[:cut + 1]
+    if sender and sender not in truncated[-(len(sender) + 5):]:
+        truncated = truncated.rstrip() + f"\n\n{sender}"
+    return truncated
+
 async def _call_anthropic(system: str, prompt: str) -> str:
     resp = await anthropic_client.messages.create(
         model=ANTHROPIC_MODEL, max_tokens=4096, system=system,
@@ -412,12 +428,17 @@ def subject_variant(idx: int) -> str:
     return "A" if idx % 2 == 0 else "B"
 
 async def generate_emails(settings: dict, leads: List[dict]):
-    system = ("You are an expert cold email copywriter. Write short, personalized, "
+    system = ("You are an expert cold email copywriter. Write detailed, personalized, "
               "high-converting cold emails. Output ONLY valid JSON.")
     sender = settings.get("sender_name", "Alex")
     offer = settings.get("offer", "custom software development")
     tone = settings.get("tone", "confident and concise")
     meeting_link = (settings.get("meeting_link") or "").strip()
+    headline = (settings.get("headline") or "").strip()
+    experience = (settings.get("experience") or "").strip()
+    skills = ", ".join((settings.get("skills") or [])[:6])
+    linkedin_url = (settings.get("linkedin_url") or "").strip()
+    proof_points = [p.strip() for p in (settings.get("proof_points") or []) if p.strip()]
     style_by_variant = {"A": "curiosity-driven question", "B": "direct value statement"}
     compact = [{"i": idx, "company": l.get("company"), "contact_name": l.get("contact_name"),
                 "title": l.get("title"), "pain_point": l.get("pain_point"),
@@ -427,33 +448,75 @@ async def generate_emails(settings: dict, leads: List[dict]):
                for idx, l in enumerate(leads)]
     meeting_note = (f'\nA booking link is available ({meeting_link}) — you may offer it as an '
                     f'alternative to proposing a call time yourself.' if meeting_link else "")
+    proof_rule = (
+        "You may cite AT MOST ONE of these real, user-verified results if one fits naturally — "
+        "quote it accurately, no embellishment:\n" + "\n".join(f"- {p}" for p in proof_points)
+    ) if proof_points else "No verified results have been provided — do not cite any statistics or results."
+    linkedin_note = f'\n- LinkedIn: {linkedin_url}' if linkedin_url else ""
+    sender_note = f"""
+About {sender} (real background):
+- Headline: {headline or "(not provided)"}
+- Experience: {experience or "(not provided)"}
+- Relevant skills: {skills or "(not provided)"}
+{proof_rule}{linkedin_note}
+REQUIRED: every email must establish {sender}'s credibility using the background above — with this
+much room, you can properly introduce who {sender} is (headline/experience), name a couple of the
+most relevant skills for this prospect's industry, and cite a proof point if one was given, in
+their own short paragraph rather than a single clause. If a LinkedIn URL is given above, include it
+once, framed as an easy way to verify the background claim (e.g. "here's my background: {{url}}")
+— never as a generic "connect with me" link."""
     prompt = f"""Write a personalized cold email for each prospect below.
 Sender name: {sender}. Offer: {offer}. Tone: {tone}.
-Rules: <=120 words, one clear CTA (a 15-min call).
+{sender} is one individual freelancer/consultant reaching out personally, not a company or team —
+always write in first person singular ("I", "my"), never "we", "our", or "our team", even though
+the offer itself may describe broader services.
+{sender_note}
+Rules: the body MUST be at least 400 words, up to 500 — this is a detailed, thorough pitch, not a
+brief teaser. Structure it as FIVE distinct paragraphs so it naturally reaches that length (do not
+pad with filler or repetition — use the room for real substance in each part):
+  1. Opening: what you noticed about their company/industry (from live_signal, pain_point, or the
+     honest industry-level observation) — 2-4 sentences.
+  2. The offer: what you build and how it applies to their specific situation — 3-5 sentences.
+  3. Your background: headline, experience, and 2-3 relevant skills, in full sentences, not a
+     fragment — 3-5 sentences.
+  4. Why it matters to them specifically: connect the offer back to the likely impact for a
+     company like theirs — 2-4 sentences.
+  5. Closing: the call-to-action, and the LinkedIn link if provided — 2-3 sentences.
+One clear CTA (a 15-min call) in the closing paragraph only.
+- Greeting is independent of everything else below: use "Hi {{first name from contact_name}}," if
+  contact_name is non-empty, regardless of how much or little else is known about the prospect.
+  Only fall back to "Hi there," or "Hi {{company}} team," when contact_name is empty.
 - If "pain_point" or "project_idea" is non-empty, reference it naturally and pitch the
   project_idea as what you could build for them.
 - If "live_signal" is non-empty, it's a real, current snippet pulled from their own website —
   weave in one specific detail from it if it fits; ignore it if it doesn't add anything concrete.
-- If pain_point, project_idea, AND live_signal are ALL empty, you have no real information about
-  this prospect beyond their name, title, company, and industry — do NOT invent a specific pain
-  point, need, or use case for them, and do not imply you've researched them or their company.
-  Instead write a SHORT (<=60 words) email: one line introducing the offer in plain terms, one
-  genuine open-ended question about their role/industry that a real person would ask, and the
-  call-to-action. Never use vague claim-of-expertise words with nothing concrete behind them —
-  "revolutionize", "streamline", "tailored", "customized", "cutting-edge", "intelligent solution",
-  "seamless" — these read as generic and unresearched, which is worse than being brief and
-  honestly curious instead.
+- If pain_point, project_idea, AND live_signal are ALL empty, you don't know anything about this
+  specific company — but you can still speak honestly to a real, well-known challenge common to
+  their industry as a whole (e.g. for auditing firms: manual documentation and close-season
+  crunch; for e-commerce: cart abandonment and fulfillment ops; for agencies: scope creep and
+  reporting overhead). Naming a real structural pain point for their industry is honest — it's
+  general knowledge, not a claim about them specifically — and far more credible than an abstract
+  question that could apply to any industry ("how is tech changing your business?"). Use that
+  industry-level challenge as paragraph 1's opening observation in the 5-paragraph structure below
+  — still hit the full length using your background (paragraph 3) and the offer's relevance
+  (paragraphs 2 and 4), you just don't have company-specific detail for paragraph 1. Never use
+  vague claim-of-expertise words with nothing concrete behind them — "revolutionize", "streamline",
+  "tailored", "customized", "cutting-edge", "intelligent solution", "seamless".
 No fluff, no "I hope this finds you well", no clickbait subject lines, and never invent
 statistics, client results, or case studies that weren't given to you — the only claims you can
-make are the pain_point and project_idea provided. Use plain straight quotes/apostrophes and
-hyphens only — no smart quotes or em-dashes. Subject line <=6 words, matching each prospect's
-"subject_style".{meeting_note}
+make are the pain_point and project_idea provided. The banned buzzwords above apply to subject
+lines too, not just the body. Use plain straight quotes/apostrophes and hyphens only — no smart
+quotes or em-dashes. Subject line <=6 words, matching each prospect's "subject_style".{meeting_note}
 Prospects: {json.dumps(compact)}
 Return a JSON array where each item has: "i" (matching index), "subject", "body".
 Body should use \\n for line breaks and end with "{sender}". Return ONLY JSON."""
     raw = await llm_call(system, prompt)
     emails = _extract_json(raw)
-    return [clean_copy_fields(e, ["subject", "body"]) for e in emails]
+    emails = [clean_copy_fields(e, ["subject", "body"]) for e in emails]
+    for e in emails:
+        if e.get("body"):
+            e["body"] = _enforce_word_limit(e["body"], sender, 500)
+    return emails
 
 def build_whatsapp_message(lead: dict, sender: str, offer: str) -> str:
     """Personalized WhatsApp opener — mirrors the email's use of pain_point/project_idea
@@ -873,12 +936,19 @@ async def fetch_foursquare_companies(regions, industries, limit) -> List[dict]:
                 if not website:
                     continue  # no domain to look up real contacts at — skip
                 loc = place.get("location", {})
+                # Prefer Foursquare's own category for this specific business over the search
+                # keyword that found it — a loose text match can surface unrelated businesses
+                # (e.g. a car dealership matching a "SaaS" search), and echoing the keyword back
+                # as their "industry" produces confidently wrong claims in generated copy.
+                cats = place.get("categories") or []
+                real_category = cats[0].get("name") if cats else None
+                industry = real_category if real_category and real_category != "Office" else keyword
                 companies.append({
                     "company": place.get("name", ""),
                     "website": website,
                     "phone": place.get("tel", ""),
                     "location": loc.get("formatted_address") or region,
-                    "industry": keyword,
+                    "industry": industry,
                 })
     return companies
 
@@ -1046,13 +1116,20 @@ async def fetch_osm_companies(regions, industries, limit) -> List[dict]:
                 website = tags.get("website") or tags.get("contact:website")
                 if not name or not website:
                     continue
+                office_tag = (tags.get("office") or "").lower()
                 region_matches.append({
                     "company": name,
                     "website": website,
                     "phone": tags.get("phone") or tags.get("contact:phone") or "",
                     "location": ", ".join(x for x in [tags.get("addr:city"), tags.get("addr:country")] if x) or region,
-                    "industry": industries[0] if industries else "",
-                    "_office_tag": (tags.get("office") or "").lower(),
+                    # Prefer OSM's own office= tag over the search keyword when it's specific
+                    # enough to mean something — otherwise a loose text match (e.g. a lawyer's
+                    # office turning up in a "SaaS" search) inherits an industry label that's
+                    # confidently wrong rather than just imprecise.
+                    "industry": (office_tag.replace("_", " ").title()
+                                 if office_tag and office_tag not in ("yes", "company", "coworking")
+                                 else (industries[0] if industries else "")),
+                    "_office_tag": office_tag,
                 })
             # Soft industry filter: OSM's "office" tag is too coarse to hard-filter on, so
             # prefer matches that mention the target industry, but don't exclude the rest.
@@ -1226,7 +1303,8 @@ async def generate_followups(settings: dict, leads: List[dict], steps: List[dict
     offer = settings.get("offer", "custom software development")
     compact = [{"i": idx, "company": l.get("company"), "contact_name": l.get("contact_name"),
                 "title": l.get("title"), "pain_point": l.get("pain_point"),
-                "industry": l.get("industry")} for idx, l in enumerate(leads)]
+                "project_idea": l.get("project_idea"), "industry": l.get("industry")}
+               for idx, l in enumerate(leads)]
     steps_desc = "\n".join(f'Follow-up #{i + 1}: {s.get("angle") or "brief, polite follow-up"}'
                            for i, s in enumerate(steps))
     proof_points = [p.strip() for p in (settings.get("proof_points") or []) if p.strip()]
@@ -1239,15 +1317,27 @@ async def generate_followups(settings: dict, leads: List[dict], steps: List[dict
     prompt = f"""For each prospect, write ONE short follow-up email per step below (they didn't reply
 to the earlier email(s) in the sequence).
 Sender: {sender}. Offer: {offer}.
+{sender} is one individual freelancer/consultant reaching out personally, not a company or team —
+always write in first person singular ("I", "my"), never "we", "our", or "our team", even though
+the offer itself may describe broader services.
 {steps_desc}
 {proof_rule}
 Never invent statistics, client results, or case studies beyond what's listed above — the only
-claims you can make are the pain_point, title, and industry given below, plus the verified result(s)
-above if any were given. If a prospect's "pain_point" is empty, don't invent one — keep that
-follow-up brief and about the offer/CTA itself (e.g. "still worth a quick call?") rather than
-guessing at a specific need. Use plain straight quotes/apostrophes and hyphens only — no smart
+claims you can make are the pain_point, project_idea, title, and industry given below, plus the
+verified result(s) above if any were given.
+If a prospect's "pain_point" AND "project_idea" are both empty, you don't know anything about this
+specific company — reference a real, well-known structural challenge common to their industry as a
+whole instead (e.g. for auditing firms: manual documentation and close-season crunch; for
+e-commerce: cart abandonment and fulfillment ops; for agencies: scope creep and reporting
+overhead). That's honest general industry knowledge, not a fabricated claim about them
+specifically, and reads far less like a template than restating the offer alone. Never use vague
+claim-of-expertise words with nothing concrete behind them — "tailored", "customized",
+"revolutionize", "streamline", "cutting-edge", "seamless", "game changer", "drive efficiency",
+"crafted specifically" — these read as generic and unresearched, in subject lines as well as body.
+No fluff, no "I hope this message/email finds you well" or similar throat-clearing — get to the
+point in the first sentence. Use plain straight quotes/apostrophes and hyphens only — no smart
 quotes or em-dashes.
-All end with "{sender}". Subjects <=5 words, can start with "Re:".
+All end with "{sender}". Subjects <=5 words, can start with "Re:". Bodies <=80 words each.
 Prospects: {json.dumps(compact)}
 Return a JSON array where each item is {{"i": <index>, "followups": [{{"subject","body"}}, ...]}}
 with exactly {len(steps)} followup(s) per prospect, in the same order as the steps above.
@@ -1255,7 +1345,11 @@ Return ONLY JSON."""
     raw = await llm_call(system, prompt)
     results = _extract_json(raw)
     for r in results:
-        r["followups"] = [clean_copy_fields(f, ["subject", "body"]) for f in r.get("followups", [])]
+        followups = [clean_copy_fields(f, ["subject", "body"]) for f in r.get("followups", [])]
+        for f in followups:
+            if f.get("body"):
+                f["body"] = _enforce_word_limit(f["body"], sender, 80)
+        r["followups"] = followups
     return results
 
 
@@ -2092,12 +2186,13 @@ async def update_settings(data: SettingsInput, user: dict = Depends(get_current_
     await pool.execute("""
         UPDATE settings SET daily_target=$1, auto_enabled=$2, regions=$3, industries=$4, offer=$5,
                             sender_name=$6, tone=$7, skills=$8, headline=$9, experience=$10, meeting_link=$11,
-                            brand_name=$12, brand_logo_url=$13, proof_points=$14
-        WHERE user_id=$15
+                            brand_name=$12, brand_logo_url=$13, proof_points=$14, linkedin_url=$15
+        WHERE user_id=$16
     """, payload["daily_target"], payload["auto_enabled"], payload["regions"], payload["industries"],
          payload["offer"], payload["sender_name"], payload["tone"], payload["skills"],
          payload["headline"], payload["experience"], payload["meeting_link"],
-         payload["brand_name"], payload["brand_logo_url"], payload["proof_points"], tid)
+         payload["brand_name"], payload["brand_logo_url"], payload["proof_points"],
+         payload["linkedin_url"], tid)
     return await get_or_create_settings(tid)
 
 

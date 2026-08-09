@@ -181,6 +181,9 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by UUID REFERENCES users(id)
 -- inventing statistics — each entry is a short, factual claim the user vouches for themselves.
 ALTER TABLE settings ADD COLUMN IF NOT EXISTS proof_points TEXT[] NOT NULL DEFAULT '{}';
 
+-- Sender's LinkedIn profile — offered as an optional credibility link in cold emails.
+ALTER TABLE settings ADD COLUMN IF NOT EXISTS linkedin_url TEXT NOT NULL DEFAULT '';
+
 -- Tier 5: public API keys, for Zapier/Make-style generic webhook/HTTP integrations.
 CREATE TABLE IF NOT EXISTS api_keys (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
