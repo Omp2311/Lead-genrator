@@ -908,21 +908,23 @@ _GITHUB_API_VERSION = "2026-03-10"  # dated API-contract pin; bump if GitHub sun
 
 async def fetch_github_companies(regions, industries, limit) -> List[dict]:
     companies = []
-    keyword = industries[0] if industries else ""
+    keyword = (industries[0] if industries else "").lower()
     headers = {"Authorization": f"Bearer {GITHUB_API_KEY}", "Accept": "application/vnd.github+json",
                "X-GitHub-Api-Version": _GITHUB_API_VERSION}
     async with httpx.AsyncClient(timeout=20) as c:
         for region in regions:
             if len(companies) >= limit:
                 break
-            query = f'type:org location:"{region}"' + (f" {keyword}" if keyword else "")
+            # Industry is intentionally NOT in the query: GitHub search requires literal term
+            # matches, and most org bios won't contain the exact industry name — that turns an
+            # AND filter into a near-guaranteed zero results. Applied as a soft sort instead.
             resp = await c.get("https://api.github.com/search/users",
-                               params={"q": query, "per_page": min(limit * 3, 30)}, headers=headers)
+                               params={"q": f'type:org location:"{region}"', "per_page": min(limit * 3, 30)},
+                               headers=headers)
             if resp.is_error:
                 raise RuntimeError(f"GitHub search error {resp.status_code}")
+            region_matches = []
             for item in resp.json().get("items", []):
-                if len(companies) >= limit:
-                    break
                 org_resp = await c.get(f"https://api.github.com/orgs/{item['login']}", headers=headers)
                 if org_resp.is_error:
                     continue
@@ -932,11 +934,17 @@ async def fetch_github_companies(regions, industries, limit) -> List[dict]:
                 email = (org.get("email") or "").strip()
                 if not website and not email:
                     continue  # nothing to reach them at or look a contact up with — skip
-                companies.append({
+                region_matches.append({
                     "company": org.get("name") or org.get("login", ""),
                     "website": website, "email": email, "phone": "",
-                    "location": org.get("location") or region, "industry": keyword,
+                    "location": org.get("location") or region, "industry": industries[0] if industries else "",
+                    "_text": f"{org.get('name', '')} {org.get('description', '')}".lower(),
                 })
+            if keyword:
+                region_matches.sort(key=lambda m: 0 if keyword in m["_text"] else 1)
+            for m in region_matches:
+                m.pop("_text", None)
+            companies.extend(region_matches[:limit - len(companies)])
     return companies
 
 async def fetch_github_leads(regions, industries, count) -> List[dict]:
