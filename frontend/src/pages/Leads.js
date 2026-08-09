@@ -27,7 +27,6 @@ const SOURCE_LABELS = {
   places_hunter: "Places + Hunter",
   foursquare_hunter: "Foursquare + Hunter",
   osm_hunter: "OpenStreetMap + Hunter",
-  yelp: "Yelp",
   csv: "CSV import",
 };
 function sourceLabel(source) {

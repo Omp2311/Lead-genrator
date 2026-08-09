@@ -76,7 +76,6 @@ APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY", "").strip()
 HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "").strip()
 GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
 FOURSQUARE_API_KEY = os.environ.get("FOURSQUARE_API_KEY", "").strip()
-YELP_API_KEY = os.environ.get("YELP_API_KEY", "").strip()
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()
@@ -134,8 +133,6 @@ async def integrations_status(user_id: str = None) -> dict:
         "foursquare_hunter_blocked": bool(HUNTER_API_KEY and FOURSQUARE_API_KEY) and _foursquare_hunter_ok is False,
         "osm_hunter_live": bool(HUNTER_API_KEY) and _osm_hunter_ok is not False,
         "osm_hunter_blocked": bool(HUNTER_API_KEY) and _osm_hunter_ok is False,
-        "yelp_live": bool(YELP_API_KEY) and _yelp_ok is not False,
-        "yelp_blocked": bool(YELP_API_KEY) and _yelp_ok is False,
         "whatsapp_live": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM),
         "reply_detection_live": bool(SMTP_USER and SMTP_PASSWORD),
     }
@@ -898,47 +895,6 @@ async def fetch_foursquare_hunter_leads(regions, industries, count) -> List[dict
 
 
 # ---------------------------------------------------------------------------
-# Real lead sourcing via Yelp Fusion (strong US/Canada/UK coverage, free tier)
-# — phone/WhatsApp outreach only. Yelp's API returns a business's Yelp listing
-# page, never its own website/domain, so there's nothing for Hunter to search
-# and these leads never get an email. Skipped automatically when a lead has
-# no phone number either, since there'd be no way to reach them at all.
-# ---------------------------------------------------------------------------
-_yelp_ok = None  # None=untested, True=working, False=blocked
-
-async def fetch_yelp_leads(regions, industries, count) -> List[dict]:
-    global _yelp_ok
-    leads = []
-    keyword = industries[0] if industries else ""
-    async with httpx.AsyncClient(timeout=20) as c:
-        for region in regions:
-            if len(leads) >= count:
-                break
-            resp = await c.get("https://api.yelp.com/v3/businesses/search",
-                               params={"location": region, "term": keyword, "limit": min(count * 3, 50)},
-                               headers={"Authorization": f"Bearer {YELP_API_KEY}"})
-            if resp.is_error:
-                if resp.status_code in (401, 403):
-                    _yelp_ok = False
-                raise RuntimeError(f"Yelp search error {resp.status_code}")
-            for biz in resp.json().get("businesses", []):
-                if len(leads) >= count:
-                    break
-                phone = biz.get("phone", "")
-                if not phone:
-                    continue  # no email and no phone — no way to reach them
-                loc = biz.get("location", {})
-                leads.append({
-                    "company": biz.get("name", ""), "contact_name": "", "title": "",
-                    "email": "", "phone": phone,
-                    "location": ", ".join(loc.get("display_address") or []) or region,
-                    "industry": keyword, "website": "", "pain_point": "",
-                })
-    _yelp_ok = True
-    return leads
-
-
-# ---------------------------------------------------------------------------
 # Real lead sourcing via OpenStreetMap (free, no API key or billing) + Hunter.io.
 # Third real source — works even without a Google Cloud billing account, at
 # the cost of coarser business categorization than Places (OSM's "office" tag
@@ -1073,19 +1029,10 @@ async def source_leads(settings: dict, count: int, region=None, industry=None):
         except Exception as e:
             logger.error(f"OSM/Hunter failed: {e}")
             errors.append(f"OSM/Hunter: {e}")
-    if YELP_API_KEY:
-        try:
-            leads = await fetch_yelp_leads(regions, industries, count)
-            if leads:
-                return leads, "yelp"
-            errors.append("Yelp found no matching businesses with a phone number for your current filters.")
-        except Exception as e:
-            logger.error(f"Yelp failed: {e}")
-            errors.append(f"Yelp: {e}")
     raise RuntimeError(
         "No real lead source is available — " +
         (" ".join(errors) if errors else "No lead integrations are connected.") +
-        " Connect Apollo, Google Places + Hunter, Foursquare + Hunter, Yelp, or just Hunter alone "
+        " Connect Apollo, Google Places + Hunter, Foursquare + Hunter, or just Hunter alone "
         "(free OpenStreetMap sourcing), or import a CSV of real contacts."
     )
 
@@ -1305,8 +1252,8 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
                  now_dt if wa_res["status"] == "sent" else None)
 
     src_label = {"apollo": "Apollo", "places_hunter": "Google Places + Hunter",
-                "foursquare_hunter": "Foursquare + Hunter", "osm_hunter": "OpenStreetMap + Hunter",
-                "yelp": "Yelp"}.get(lead_source, lead_source)
+                "foursquare_hunter": "Foursquare + Hunter",
+                "osm_hunter": "OpenStreetMap + Hunter"}.get(lead_source, lead_source)
     await pool.execute("""
         INSERT INTO activity (id, user_id, type, message, created_at)
         VALUES ($1,$2,$3,$4,$5)
