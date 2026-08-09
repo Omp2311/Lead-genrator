@@ -89,3 +89,5 @@ android-sdk/
 credentials.json
 *.key
 .credentials
+cookies.txt
+*.cookies
