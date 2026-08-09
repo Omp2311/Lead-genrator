@@ -22,7 +22,12 @@ function copyText(text) {
   toast.success("Copied.");
 }
 
-const SOURCE_LABELS = { apollo: "Apollo", places_hunter: "Places + Hunter", csv: "CSV import" };
+const SOURCE_LABELS = {
+  apollo: "Apollo",
+  places_hunter: "Places + Hunter",
+  osm_hunter: "OpenStreetMap + Hunter",
+  csv: "CSV import",
+};
 function sourceLabel(source) {
   return SOURCE_LABELS[source] || source || "Unknown";
 }

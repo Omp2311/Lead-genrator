@@ -128,6 +128,8 @@ async def integrations_status(user_id: str = None) -> dict:
         "leads_blocked": bool(APOLLO_API_KEY) and _apollo_ok is False,
         "places_hunter_live": bool(HUNTER_API_KEY and GOOGLE_PLACES_API_KEY) and _places_hunter_ok is not False,
         "places_hunter_blocked": bool(HUNTER_API_KEY and GOOGLE_PLACES_API_KEY) and _places_hunter_ok is False,
+        "osm_hunter_live": bool(HUNTER_API_KEY) and _osm_hunter_ok is not False,
+        "osm_hunter_blocked": bool(HUNTER_API_KEY) and _osm_hunter_ok is False,
         "whatsapp_live": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM),
         "reply_detection_live": bool(SMTP_USER and SMTP_PASSWORD),
     }
@@ -824,6 +826,102 @@ async def fetch_places_hunter_leads(regions, industries, count) -> List[dict]:
     _places_hunter_ok = True
     return leads
 
+
+# ---------------------------------------------------------------------------
+# Real lead sourcing via OpenStreetMap (free, no API key or billing) + Hunter.io.
+# Third real source — works even without a Google Cloud billing account, at
+# the cost of coarser business categorization than Places (OSM's "office" tag
+# doesn't distinguish verticals like "Fintech" from "IT Services").
+#
+# Nominatim/Overpass are shared, rate-limited public services — this queries
+# once per region (not per region x industry, unlike Places) and pauses
+# between geocoding calls to stay within their fair-use guidelines. Fine for
+# occasional lead-gen runs; not meant for high-volume/bulk use.
+# ---------------------------------------------------------------------------
+_osm_hunter_ok = None  # None=untested, True=working, False=blocked
+
+_NOMINATIM_UA = f"OutreachPilot-LeadGen/1.0 (contact: {SENDER_EMAIL or 'no-reply@example.com'})"
+
+async def _geocode_region(c: httpx.AsyncClient, region: str) -> Optional[tuple]:
+    """Region name -> (south, west, north, east) bounding box, via OSM's free Nominatim geocoder."""
+    resp = await c.get("https://nominatim.openstreetmap.org/search",
+                       params={"q": region, "format": "json", "limit": 1},
+                       headers={"User-Agent": _NOMINATIM_UA})
+    if resp.is_error:
+        return None
+    results = resp.json()
+    if not results or not results[0].get("boundingbox"):
+        return None
+    south, north, west, east = (float(x) for x in results[0]["boundingbox"])
+    return south, west, north, east
+
+async def fetch_osm_companies(regions, industries, limit) -> List[dict]:
+    """Real companies with a listed website, via OpenStreetMap Overpass — free, no API key."""
+    companies = []
+    keyword = (industries[0] if industries else "").lower()
+    async with httpx.AsyncClient(timeout=30) as c:
+        for region in regions:
+            if len(companies) >= limit:
+                break
+            await asyncio.sleep(1)  # Nominatim fair-use: max ~1 request/second
+            bbox = await _geocode_region(c, region)
+            if not bbox:
+                continue
+            south, west, north, east = bbox
+            query = (f'[out:json][timeout:25];(node["office"]({south},{west},{north},{east});'
+                     f'way["office"]({south},{west},{north},{east}););out center tags {limit * 3};')
+            resp = await c.post("https://overpass-api.de/api/interpreter",
+                                data={"data": query}, headers={"User-Agent": _NOMINATIM_UA})
+            if resp.is_error:
+                continue
+            region_matches = []
+            for el in resp.json().get("elements", []):
+                tags = el.get("tags", {})
+                name = tags.get("name")
+                website = tags.get("website") or tags.get("contact:website")
+                if not name or not website:
+                    continue
+                region_matches.append({
+                    "company": name,
+                    "website": website,
+                    "phone": tags.get("phone") or tags.get("contact:phone") or "",
+                    "location": ", ".join(x for x in [tags.get("addr:city"), tags.get("addr:country")] if x) or region,
+                    "industry": industries[0] if industries else "",
+                    "_office_tag": (tags.get("office") or "").lower(),
+                })
+            # Soft industry filter: OSM's "office" tag is too coarse to hard-filter on, so
+            # prefer matches that mention the target industry, but don't exclude the rest.
+            if keyword:
+                region_matches.sort(key=lambda m: 0 if keyword in (m["company"] + m["_office_tag"]).lower() else 1)
+            for m in region_matches:
+                m.pop("_office_tag", None)
+            companies.extend(region_matches)
+    return companies[:limit]
+
+async def fetch_osm_hunter_leads(regions, industries, count) -> List[dict]:
+    global _osm_hunter_ok
+    companies = await fetch_osm_companies(regions, industries, count * 4)
+    leads = []
+    for comp in companies:
+        if len(leads) >= count:
+            break
+        domain = _domain_from_url(comp["website"])
+        try:
+            contact = await fetch_hunter_contact(domain)
+        except Exception as e:
+            logger.warning(f"Hunter lookup failed for {domain}: {e}")
+            continue
+        if not contact:
+            continue
+        leads.append({
+            "company": comp["company"], "contact_name": contact["contact_name"],
+            "title": contact["title"], "email": contact["email"], "phone": comp.get("phone", ""),
+            "location": comp.get("location", ""), "industry": comp.get("industry", ""),
+            "website": comp["website"], "pain_point": "",
+        })
+    _osm_hunter_ok = True
+    return leads
+
 async def source_leads(settings: dict, count: int, region=None, industry=None):
     regions = [region] if region else settings.get("regions", ["Dubai, UAE", "United States"])
     industries = [industry] if industry else settings.get("industries", ["SaaS", "IT Services"])
@@ -846,10 +944,20 @@ async def source_leads(settings: dict, count: int, region=None, industry=None):
         except Exception as e:
             logger.error(f"Places/Hunter failed: {e}")
             errors.append(f"Places/Hunter: {e}")
+    if HUNTER_API_KEY:
+        try:
+            leads = await fetch_osm_hunter_leads(regions, industries, count)
+            if leads:
+                return leads, "osm_hunter"
+            errors.append("OpenStreetMap + Hunter found no matching companies for your current filters.")
+        except Exception as e:
+            logger.error(f"OSM/Hunter failed: {e}")
+            errors.append(f"OSM/Hunter: {e}")
     raise RuntimeError(
         "No real lead source is available — " +
         (" ".join(errors) if errors else "No lead integrations are connected.") +
-        " Connect Apollo or Google Places + Hunter, or import a CSV of real contacts."
+        " Connect Apollo, Google Places + Hunter, or just Hunter (free OpenStreetMap sourcing), "
+        "or import a CSV of real contacts."
     )
 
 
@@ -1066,7 +1174,8 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
                  wa_res.get("simulated", False), wa_res.get("error"), wa, now_dt,
                  now_dt if wa_res["status"] == "sent" else None)
 
-    src_label = {"apollo": "Apollo", "places_hunter": "Google Places + Hunter"}.get(lead_source, lead_source)
+    src_label = {"apollo": "Apollo", "places_hunter": "Google Places + Hunter",
+                "osm_hunter": "OpenStreetMap + Hunter"}.get(lead_source, lead_source)
     await pool.execute("""
         INSERT INTO activity (id, user_id, type, message, created_at)
         VALUES ($1,$2,$3,$4,$5)
