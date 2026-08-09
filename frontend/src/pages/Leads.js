@@ -25,7 +25,9 @@ function copyText(text) {
 const SOURCE_LABELS = {
   apollo: "Apollo",
   places_hunter: "Places + Hunter",
+  foursquare_hunter: "Foursquare + Hunter",
   osm_hunter: "OpenStreetMap + Hunter",
+  yelp: "Yelp",
   csv: "CSV import",
 };
 function sourceLabel(source) {
@@ -81,10 +83,16 @@ function LeadCard({ l, i, onMarkReplied }) {
         <p className="flex items-center gap-2 text-zinc-400">
           <MapPin className="w-3.5 h-3.5 text-zinc-500" /> {l.location}
         </p>
-        <p className="flex items-center gap-2 text-zinc-400 truncate">
-          <Mail className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
-          <span className="truncate font-mono text-xs">{l.email}</span>
-        </p>
+        {l.email ? (
+          <p className="flex items-center gap-2 text-zinc-400 truncate">
+            <Mail className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
+            <span className="truncate font-mono text-xs">{l.email}</span>
+          </p>
+        ) : (
+          <p className="flex items-center gap-2 text-zinc-600">
+            <Mail className="w-3.5 h-3.5" /> <span className="text-xs">No email — reach out via WhatsApp</span>
+          </p>
+        )}
         {l.phone ? (
           <p className="flex items-center gap-2 text-zinc-400">
             <Phone className="w-3.5 h-3.5 text-zinc-500" />

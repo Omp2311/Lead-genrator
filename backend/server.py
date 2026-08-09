@@ -75,6 +75,8 @@ IMAP_PORT = int(os.environ.get("IMAP_PORT", "993") or 993)
 APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY", "").strip()
 HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "").strip()
 GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
+FOURSQUARE_API_KEY = os.environ.get("FOURSQUARE_API_KEY", "").strip()
+YELP_API_KEY = os.environ.get("YELP_API_KEY", "").strip()
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()
@@ -128,8 +130,12 @@ async def integrations_status(user_id: str = None) -> dict:
         "leads_blocked": bool(APOLLO_API_KEY) and _apollo_ok is False,
         "places_hunter_live": bool(HUNTER_API_KEY and GOOGLE_PLACES_API_KEY) and _places_hunter_ok is not False,
         "places_hunter_blocked": bool(HUNTER_API_KEY and GOOGLE_PLACES_API_KEY) and _places_hunter_ok is False,
+        "foursquare_hunter_live": bool(HUNTER_API_KEY and FOURSQUARE_API_KEY) and _foursquare_hunter_ok is not False,
+        "foursquare_hunter_blocked": bool(HUNTER_API_KEY and FOURSQUARE_API_KEY) and _foursquare_hunter_ok is False,
         "osm_hunter_live": bool(HUNTER_API_KEY) and _osm_hunter_ok is not False,
         "osm_hunter_blocked": bool(HUNTER_API_KEY) and _osm_hunter_ok is False,
+        "yelp_live": bool(YELP_API_KEY) and _yelp_ok is not False,
+        "yelp_blocked": bool(YELP_API_KEY) and _yelp_ok is False,
         "whatsapp_live": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM),
         "reply_detection_live": bool(SMTP_USER and SMTP_PASSWORD),
     }
@@ -828,6 +834,108 @@ async def fetch_places_hunter_leads(regions, industries, count) -> List[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Real lead sourcing via Foursquare Places (worldwide business directory,
+# free tier, no billing account required — unlike Google Places) + Hunter.io.
+# Foursquare resolves a plain-text location server-side, so no separate
+# geocoding step is needed. Like OSM, its categories are broad rather than
+# precise verticals, so "industry" is used as a soft text filter only.
+# ---------------------------------------------------------------------------
+_foursquare_hunter_ok = None  # None=untested, True=working, False=blocked
+
+async def fetch_foursquare_companies(regions, industries, limit) -> List[dict]:
+    companies = []
+    keyword = industries[0] if industries else ""
+    async with httpx.AsyncClient(timeout=20) as c:
+        for region in regions:
+            if len(companies) >= limit:
+                break
+            resp = await c.get("https://api.foursquare.com/v3/places/search",
+                               params={"near": region, "query": keyword, "limit": min(limit * 3, 50),
+                                       "fields": "name,website,tel,location,categories"},
+                               headers={"Authorization": FOURSQUARE_API_KEY, "Accept": "application/json"})
+            if resp.is_error:
+                raise RuntimeError(f"Foursquare search error {resp.status_code}")
+            for place in resp.json().get("results", []):
+                website = place.get("website")
+                if not website:
+                    continue  # no domain to look up real contacts at — skip
+                loc = place.get("location", {})
+                companies.append({
+                    "company": place.get("name", ""),
+                    "website": website,
+                    "phone": place.get("tel", ""),
+                    "location": loc.get("formatted_address") or region,
+                    "industry": keyword,
+                })
+    return companies
+
+async def fetch_foursquare_hunter_leads(regions, industries, count) -> List[dict]:
+    global _foursquare_hunter_ok
+    companies = await fetch_foursquare_companies(regions, industries, count * 4)
+    leads = []
+    for comp in companies:
+        if len(leads) >= count:
+            break
+        domain = _domain_from_url(comp["website"])
+        try:
+            contact = await fetch_hunter_contact(domain)
+        except Exception as e:
+            logger.warning(f"Hunter lookup failed for {domain}: {e}")
+            continue
+        if not contact:
+            continue
+        leads.append({
+            "company": comp["company"], "contact_name": contact["contact_name"],
+            "title": contact["title"], "email": contact["email"], "phone": comp.get("phone", ""),
+            "location": comp.get("location", ""), "industry": comp.get("industry", ""),
+            "website": comp["website"], "pain_point": "",
+        })
+    _foursquare_hunter_ok = True
+    return leads
+
+
+# ---------------------------------------------------------------------------
+# Real lead sourcing via Yelp Fusion (strong US/Canada/UK coverage, free tier)
+# — phone/WhatsApp outreach only. Yelp's API returns a business's Yelp listing
+# page, never its own website/domain, so there's nothing for Hunter to search
+# and these leads never get an email. Skipped automatically when a lead has
+# no phone number either, since there'd be no way to reach them at all.
+# ---------------------------------------------------------------------------
+_yelp_ok = None  # None=untested, True=working, False=blocked
+
+async def fetch_yelp_leads(regions, industries, count) -> List[dict]:
+    global _yelp_ok
+    leads = []
+    keyword = industries[0] if industries else ""
+    async with httpx.AsyncClient(timeout=20) as c:
+        for region in regions:
+            if len(leads) >= count:
+                break
+            resp = await c.get("https://api.yelp.com/v3/businesses/search",
+                               params={"location": region, "term": keyword, "limit": min(count * 3, 50)},
+                               headers={"Authorization": f"Bearer {YELP_API_KEY}"})
+            if resp.is_error:
+                if resp.status_code in (401, 403):
+                    _yelp_ok = False
+                raise RuntimeError(f"Yelp search error {resp.status_code}")
+            for biz in resp.json().get("businesses", []):
+                if len(leads) >= count:
+                    break
+                phone = biz.get("phone", "")
+                if not phone:
+                    continue  # no email and no phone — no way to reach them
+                loc = biz.get("location", {})
+                leads.append({
+                    "company": biz.get("name", ""), "contact_name": "", "title": "",
+                    "email": "", "phone": phone,
+                    "location": ", ".join(loc.get("display_address") or []) or region,
+                    "industry": keyword, "website": "", "pain_point": "",
+                })
+    _yelp_ok = True
+    return leads
+
+
+# ---------------------------------------------------------------------------
 # Real lead sourcing via OpenStreetMap (free, no API key or billing) + Hunter.io.
 # Third real source — works even without a Google Cloud billing account, at
 # the cost of coarser business categorization than Places (OSM's "office" tag
@@ -944,6 +1052,15 @@ async def source_leads(settings: dict, count: int, region=None, industry=None):
         except Exception as e:
             logger.error(f"Places/Hunter failed: {e}")
             errors.append(f"Places/Hunter: {e}")
+    if HUNTER_API_KEY and FOURSQUARE_API_KEY:
+        try:
+            leads = await fetch_foursquare_hunter_leads(regions, industries, count)
+            if leads:
+                return leads, "foursquare_hunter"
+            errors.append("Foursquare + Hunter found no matching companies for your current filters.")
+        except Exception as e:
+            logger.error(f"Foursquare/Hunter failed: {e}")
+            errors.append(f"Foursquare/Hunter: {e}")
     if HUNTER_API_KEY:
         try:
             leads = await fetch_osm_hunter_leads(regions, industries, count)
@@ -953,11 +1070,20 @@ async def source_leads(settings: dict, count: int, region=None, industry=None):
         except Exception as e:
             logger.error(f"OSM/Hunter failed: {e}")
             errors.append(f"OSM/Hunter: {e}")
+    if YELP_API_KEY:
+        try:
+            leads = await fetch_yelp_leads(regions, industries, count)
+            if leads:
+                return leads, "yelp"
+            errors.append("Yelp found no matching businesses with a phone number for your current filters.")
+        except Exception as e:
+            logger.error(f"Yelp failed: {e}")
+            errors.append(f"Yelp: {e}")
     raise RuntimeError(
         "No real lead source is available — " +
         (" ".join(errors) if errors else "No lead integrations are connected.") +
-        " Connect Apollo, Google Places + Hunter, or just Hunter (free OpenStreetMap sourcing), "
-        "or import a CSV of real contacts."
+        " Connect Apollo, Google Places + Hunter, Foursquare + Hunter, Yelp, or just Hunter alone "
+        "(free OpenStreetMap sourcing), or import a CSV of real contacts."
     )
 
 
@@ -1090,7 +1216,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
     leads = await attach_linkedin_drafts(settings, leads)
     has_inbox = bool(await pool.fetchval(
         "SELECT count(*) FROM inboxes WHERE user_id=$1 AND is_active=true", user_id))
-    deliver = _email_configured() or has_inbox
+    email_ready = _email_configured() or has_inbox
     emails = await generate_emails(settings, leads)
     email_by_i = {e.get("i"): e for e in emails}
     steps = await get_sequence_steps(user_id)
@@ -1112,6 +1238,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
         lead_id = str(uuid.uuid4())
         phone = (lead.get("phone") or "").strip()
         to_email = lead.get("email", "")
+        deliver = email_ready and bool(to_email)
         suppressed_lead = await is_suppressed(user_id, to_email) if to_email else False
         wa = whatsapp_link(phone, lead, sender, settings.get("offer", "")) if phone else None
         await pool.execute("""
@@ -1175,7 +1302,8 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
                  now_dt if wa_res["status"] == "sent" else None)
 
     src_label = {"apollo": "Apollo", "places_hunter": "Google Places + Hunter",
-                "osm_hunter": "OpenStreetMap + Hunter"}.get(lead_source, lead_source)
+                "foursquare_hunter": "Foursquare + Hunter", "osm_hunter": "OpenStreetMap + Hunter",
+                "yelp": "Yelp"}.get(lead_source, lead_source)
     await pool.execute("""
         INSERT INTO activity (id, user_id, type, message, created_at)
         VALUES ($1,$2,$3,$4,$5)
