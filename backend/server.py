@@ -15,9 +15,12 @@ import io
 import re
 import html as html_lib
 import hashlib
+import ipaddress
+import socket
+from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta, date
 from typing import List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import bcrypt
 import jwt
@@ -77,6 +80,7 @@ TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()
 BACKEND_URL = os.environ.get("BACKEND_URL", "").strip().rstrip("/")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000").strip().rstrip("/")
+IS_PRODUCTION = FRONTEND_URL.startswith("https://")
 
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
@@ -131,7 +135,12 @@ async def integrations_status(user_id: str = None) -> dict:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("outreachpilot")
 
-app = FastAPI(title="OutreachPilot")
+app = FastAPI(
+    title="OutreachPilot",
+    docs_url=None if IS_PRODUCTION else "/docs",
+    redoc_url=None if IS_PRODUCTION else "/redoc",
+    openapi_url=None if IS_PRODUCTION else "/openapi.json",
+)
 api_router = APIRouter(prefix="/api")
 public_router = APIRouter(prefix="/api/public/v1")
 
@@ -155,8 +164,22 @@ def create_refresh_token(user_id: str) -> str:
                "exp": datetime.now(timezone.utc) + timedelta(days=7)}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-COOKIE_SECURE = FRONTEND_URL.startswith("https://")
+COOKIE_SECURE = IS_PRODUCTION
 COOKIE_SAMESITE = "none" if COOKIE_SECURE else "lax"
+
+_DUMMY_PASSWORD_HASH = bcrypt.hashpw(b"timing-attack-mitigation", bcrypt.gensalt()).decode("utf-8")
+
+_rate_limit_buckets: dict = defaultdict(deque)
+
+def rate_limit(key: str, max_requests: int, window_seconds: int):
+    """In-memory sliding-window limiter. Per-process only — fine for a single-instance deploy."""
+    now = datetime.now(timezone.utc).timestamp()
+    bucket = _rate_limit_buckets[key]
+    while bucket and now - bucket[0] > window_seconds:
+        bucket.popleft()
+    if len(bucket) >= max_requests:
+        raise HTTPException(status_code=429, detail="Too many attempts. Please try again later.")
+    bucket.append(now)
 
 def set_auth_cookies(response: Response, access: str, refresh: str):
     response.set_cookie("access_token", access, httponly=True, secure=COOKIE_SECURE,
@@ -220,7 +243,7 @@ async def plan_limits_for(tid: str) -> dict:
 class RegisterInput(BaseModel):
     name: str
     email: EmailStr
-    password: str
+    password: str = Field(min_length=8)
     ref: Optional[str] = None
 
 class LoginInput(BaseModel):
@@ -267,7 +290,7 @@ class SequenceStepInput(BaseModel):
 class TeamMemberInput(BaseModel):
     name: str
     email: EmailStr
-    password: str
+    password: str = Field(min_length=8)
 
 class CheckoutInput(BaseModel):
     plan: str
@@ -868,11 +891,27 @@ def _clean_html_text(raw: str) -> str:
     text = html_lib.unescape(raw)
     return re.sub(r"\s+", " ", text).strip()
 
+def _resolves_to_public_address(url: str) -> bool:
+    """Blocks SSRF: refuses to fetch hosts that resolve to loopback/private/link-local/reserved IPs."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False
+        for family, _, _, _, sockaddr in socket.getaddrinfo(parsed.hostname, None):
+            ip = ipaddress.ip_address(sockaddr[0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                return False
+        return True
+    except Exception:
+        return False
+
 async def fetch_company_signal(website: str) -> str:
     """Best-effort: title + meta description from a lead's own website, truncated. Empty on any failure."""
     if not website:
         return ""
     url = website if website.startswith("http") else f"https://{website}"
+    if not _resolves_to_public_address(url):
+        return ""
     try:
         async with httpx.AsyncClient(timeout=6, follow_redirects=True) as c:
             resp = await c.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; OutreachPilotBot/1.0)"})
@@ -1415,7 +1454,8 @@ async def _gen_referral_code() -> str:
     return secrets.token_hex(6).upper()
 
 @api_router.post("/auth/register")
-async def register(data: RegisterInput, response: Response):
+async def register(data: RegisterInput, request: Request, response: Response):
+    rate_limit(f"register:{request.client.host}", max_requests=5, window_seconds=3600)
     email = data.email.lower()
     if await pool.fetchrow("SELECT 1 FROM users WHERE email=$1", email):
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -1434,10 +1474,14 @@ async def register(data: RegisterInput, response: Response):
     return {"id": uid, "email": email, "name": data.name, "role": "user", "owner_id": None}
 
 @api_router.post("/auth/login")
-async def login(data: LoginInput, response: Response):
+async def login(data: LoginInput, request: Request, response: Response):
+    rate_limit(f"login:{request.client.host}", max_requests=10, window_seconds=300)
     email = data.email.lower()
     user = rec(await pool.fetchrow("SELECT * FROM users WHERE email=$1", email))
-    if not user or not verify_password(data.password, user["password_hash"]):
+    # Always run bcrypt, even for a nonexistent email, so response time can't be used to enumerate accounts.
+    password_hash = user["password_hash"] if user else _DUMMY_PASSWORD_HASH
+    password_ok = verify_password(data.password, password_hash)
+    if not user or not password_ok:
         raise HTTPException(status_code=401, detail="Invalid email or password")
     uid = user["id"]  # the actual login's own identity — JWT subject, never the tenant/workspace id
     set_auth_cookies(response, create_access_token(uid, email), create_refresh_token(uid))
@@ -1456,6 +1500,7 @@ async def me(user: dict = Depends(get_current_user)):
 
 @api_router.post("/auth/refresh")
 async def refresh(request: Request, response: Response):
+    rate_limit(f"refresh:{request.client.host}", max_requests=30, window_seconds=300)
     token = request.cookies.get("refresh_token")
     if not token:
         raise HTTPException(status_code=401, detail="No refresh token")
