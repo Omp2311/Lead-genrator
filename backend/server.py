@@ -250,6 +250,10 @@ class LoginInput(BaseModel):
     email: EmailStr
     password: str
 
+class PasswordChangeInput(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
+
 class RunInput(BaseModel):
     count: int = 8
     region: Optional[str] = None
@@ -1497,6 +1501,16 @@ async def logout(response: Response):
 @api_router.get("/auth/me")
 async def me(user: dict = Depends(get_current_user)):
     return user
+
+@api_router.post("/auth/change-password")
+async def change_password(data: PasswordChangeInput, user: dict = Depends(get_current_user)):
+    rate_limit(f"change-password:{user['id']}", max_requests=10, window_seconds=300)
+    password_hash = await pool.fetchval("SELECT password_hash FROM users WHERE id=$1", user["id"])
+    if not verify_password(data.current_password, password_hash):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    await pool.execute("UPDATE users SET password_hash=$1 WHERE id=$2",
+                       hash_password(data.new_password), user["id"])
+    return {"message": "Password updated"}
 
 @api_router.post("/auth/refresh")
 async def refresh(request: Request, response: Response):

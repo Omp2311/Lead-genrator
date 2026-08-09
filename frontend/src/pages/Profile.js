@@ -1,7 +1,86 @@
 import { useEffect, useState } from "react";
-import api from "@/lib/api";
+import api, { formatApiErrorDetail } from "@/lib/api";
 import { toast } from "sonner";
-import { Loader2, Save, User, Sparkles, Briefcase, Palette } from "lucide-react";
+import { Loader2, Save, User, Sparkles, Briefcase, Palette, Lock } from "lucide-react";
+
+const PasswordSection = () => {
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [changing, setChanging] = useState(false);
+
+  const changePassword = async () => {
+    if (newPassword !== confirmPassword) {
+      toast.error("New password and confirmation don't match.");
+      return;
+    }
+    setChanging(true);
+    try {
+      await api.post("/auth/change-password", {
+        current_password: currentPassword,
+        new_password: newPassword,
+      });
+      toast.success("Password updated.");
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+    } catch (e) {
+      toast.error(formatApiErrorDetail(e.response?.data?.detail));
+    } finally {
+      setChanging(false);
+    }
+  };
+
+  return (
+    <div className="bg-[#18181B] border border-zinc-800 rounded-md p-6 space-y-5">
+      <h3 className="font-display font-semibold text-lg flex items-center gap-2">
+        <Lock className="w-4 h-4 text-cyan-400" /> Account security
+      </h3>
+      <div className="grid sm:grid-cols-2 gap-5">
+        <div className="sm:col-span-2">
+          <label className="text-xs uppercase tracking-wider text-zinc-500">Current password</label>
+          <input
+            data-testid="current-password-input"
+            type="password"
+            value={currentPassword}
+            onChange={(e) => setCurrentPassword(e.target.value)}
+            className="mt-1 w-full bg-[#0f0f11] border border-zinc-800 rounded-sm px-3 py-2 text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none transition-colors"
+          />
+        </div>
+        <div>
+          <label className="text-xs uppercase tracking-wider text-zinc-500">New password</label>
+          <input
+            data-testid="new-password-input"
+            type="password"
+            value={newPassword}
+            onChange={(e) => setNewPassword(e.target.value)}
+            placeholder="At least 8 characters"
+            className="mt-1 w-full bg-[#0f0f11] border border-zinc-800 rounded-sm px-3 py-2 text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none transition-colors"
+          />
+        </div>
+        <div>
+          <label className="text-xs uppercase tracking-wider text-zinc-500">Confirm new password</label>
+          <input
+            data-testid="confirm-password-input"
+            type="password"
+            value={confirmPassword}
+            onChange={(e) => setConfirmPassword(e.target.value)}
+            className="mt-1 w-full bg-[#0f0f11] border border-zinc-800 rounded-sm px-3 py-2 text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none transition-colors"
+          />
+        </div>
+      </div>
+      <button
+        data-testid="change-password-button"
+        onClick={changePassword}
+        disabled={changing || !currentPassword || !newPassword}
+        className="flex items-center gap-2 bg-zinc-100 text-[#09090B] font-semibold px-6 py-3 rounded-sm hover:bg-white transition-colors disabled:opacity-60"
+      >
+        {changing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Lock className="w-4 h-4" />}
+        Update password
+      </button>
+    </div>
+  );
+};
 
 const TagInput = ({ label, values, onChange, testid, placeholder }) => {
   const [text, setText] = useState("");
@@ -198,6 +277,8 @@ export default function Profile() {
             </div>
           </div>
         </div>
+
+        <PasswordSection />
 
         <button
           data-testid="profile-save-button"
