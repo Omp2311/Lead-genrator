@@ -849,10 +849,13 @@ async def fetch_foursquare_companies(regions, industries, limit) -> List[dict]:
         for region in regions:
             if len(companies) >= limit:
                 break
-            resp = await c.get("https://api.foursquare.com/v3/places/search",
-                               params={"near": region, "query": keyword, "limit": min(limit * 3, 50),
-                                       "fields": "name,website,tel,location,categories"},
-                               headers={"Authorization": FOURSQUARE_API_KEY, "Accept": "application/json"})
+            # X-Places-Api-Version is a dated API-contract pin (Foursquare's equivalent of
+            # Stripe's API versioning) — bump this if Foursquare sunsets this version.
+            resp = await c.get("https://places-api.foursquare.com/places/search",
+                               params={"near": region, "query": keyword, "limit": min(limit * 3, 50)},
+                               headers={"Authorization": f"Bearer {FOURSQUARE_API_KEY}",
+                                       "X-Places-Api-Version": "2025-06-17",
+                                       "Accept": "application/json"})
             if resp.is_error:
                 raise RuntimeError(f"Foursquare search error {resp.status_code}")
             for place in resp.json().get("results", []):
