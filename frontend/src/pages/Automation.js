@@ -294,8 +294,7 @@ export default function Automation() {
         offer: s.offer,
         tone: s.tone,
       });
-      const isReal = ["apollo", "places_hunter", "csv"].includes(r.data.lead_source);
-      const mode = r.data.email_live && isReal ? "delivered" : "drafted (demo)";
+      const mode = r.data.email_live ? "delivered" : "drafted";
       toast.success(`${r.data.leads} leads · ${r.data.emails} emails ${mode}`);
     } catch (e) {
       toast.error(formatApiErrorDetail(e?.response?.data?.detail) || "Run failed.");
@@ -372,8 +371,8 @@ export default function Automation() {
             </div>
             {!integ.leads_live && (
               <p className="text-xs text-amber-400/80 mt-3 leading-relaxed">
-                Note: leads are AI-generated demo data until Apollo is connected. To protect your email
-                reputation, real sending only fires for real (Apollo) leads — demo emails stay simulated.
+                Note: no real lead source is connected yet, so "Run outreach now" will error until you
+                connect Apollo or Google Places + Hunter, or import a CSV of real contacts instead.
               </p>
             )}
           </div>

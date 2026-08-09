@@ -22,6 +22,11 @@ function copyText(text) {
   toast.success("Copied.");
 }
 
+const SOURCE_LABELS = { apollo: "Apollo", places_hunter: "Places + Hunter", csv: "CSV import" };
+function sourceLabel(source) {
+  return SOURCE_LABELS[source] || source || "Unknown";
+}
+
 function LeadCard({ l, i, onMarkReplied }) {
   const [drafting, setDrafting] = useState(false);
   const [linkedin, setLinkedin] = useState(
@@ -51,9 +56,17 @@ function LeadCard({ l, i, onMarkReplied }) {
           <h3 className="font-display font-semibold text-base leading-tight">{l.contact_name}</h3>
           <p className="text-xs text-zinc-500 mt-0.5">{l.title}</p>
         </div>
-        <span className="text-[10px] uppercase tracking-wider bg-zinc-800 text-zinc-300 px-2 py-1 rounded-sm shrink-0">
-          {l.industry}
-        </span>
+        <div className="flex flex-col items-end gap-1 shrink-0">
+          <span className="text-[10px] uppercase tracking-wider bg-zinc-800 text-zinc-300 px-2 py-1 rounded-sm">
+            {l.industry}
+          </span>
+          <span
+            data-testid={`lead-source-${i}`}
+            className="text-[10px] uppercase tracking-wider bg-zinc-800/60 text-cyan-400/80 px-2 py-1 rounded-sm"
+          >
+            {sourceLabel(l.lead_source)}
+          </span>
+        </div>
       </div>
 
       <div className="mt-4 space-y-2 text-sm">

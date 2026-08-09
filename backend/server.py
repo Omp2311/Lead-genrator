@@ -260,7 +260,6 @@ class RunInput(BaseModel):
     industry: Optional[str] = None
     offer: Optional[str] = None
     tone: Optional[str] = None
-    allow_demo: bool = False
 
 class SettingsInput(BaseModel):
     daily_target: int = 100
@@ -399,36 +398,6 @@ async def llm_call(system: str, prompt: str) -> str:
                 last_err = e
     raise RuntimeError(f"No LLM provider available/working (set ANTHROPIC_API_KEY and/or "
                        f"OPENAI_API_KEY in backend/.env). Last error: {last_err}")
-
-async def generate_leads(settings: dict, count: int, region=None, industry=None):
-    regions = [region] if region else settings.get("regions", ["Dubai, UAE", "USA"])
-    industries = [industry] if industry else settings.get("industries", ["SaaS", "IT Services"])
-    skills = settings.get("skills", ["Python", "React", "GenAI"])
-    system = ("You are a B2B sales research assistant that produces realistic, plausible "
-              "prospect company profiles for a cold outreach demo. Output ONLY valid JSON.")
-    prompt = f"""Generate {count} realistic B2B prospect leads for a freelancer/agency doing cold outreach.
-The sender's skills: {', '.join(skills)}. Offer: {settings.get('offer','custom software')}.
-Target regions: {', '.join(regions)}. Target industries: {', '.join(industries)}.
-Focus on high-IT-density cities (Dubai, Silicon Valley, New York, Austin, London).
-Each lead is a decision maker (Founder/CTO/Head of Growth) at a plausible company that would
-plausibly NEED the sender's skills.
-Return a JSON array. Each item MUST have keys:
-"company", "contact_name", "title", "email" (plausible corporate email),
-"phone" (E.164 with country code, or empty string for ~30% of them),
-"location", "industry", "website", "pain_point" (1 short sentence specific to them),
-"project_idea" (1 sentence: a concrete project the sender could build for them, using ONLY
-the skill(s) from the sender's list that are genuinely appropriate for that specific type of
-work — never misuse a skill's category, e.g. Django/FastAPI/Node.js are backend web frameworks,
-NOT CI/CD tools, and React is a frontend library, NOT a database. If no listed skill fits the
-pain_point well, pick the closest realistic one rather than forcing a mismatch),
-"estimated_value" (a realistic project budget range in USD, e.g. "$4k-$8k").
-Use plain straight quotes/apostrophes and hyphens only — no smart quotes or em-dashes.
-Return ONLY the JSON array, no prose."""
-    raw = await llm_call(system, prompt)
-    leads = _extract_json(raw)
-    text_keys = ["company", "contact_name", "title", "location", "industry", "website",
-                 "pain_point", "project_idea", "estimated_value"]
-    return [clean_copy_fields(l, text_keys) for l in leads]
 
 def subject_variant(idx: int) -> str:
     """Alternates two subject-line styles across a batch so open rates can be A/B compared."""
@@ -855,7 +824,7 @@ async def fetch_places_hunter_leads(regions, industries, count) -> List[dict]:
     _places_hunter_ok = True
     return leads
 
-async def source_leads(settings: dict, count: int, region=None, industry=None, allow_demo: bool = False):
+async def source_leads(settings: dict, count: int, region=None, industry=None):
     regions = [region] if region else settings.get("regions", ["Dubai, UAE", "United States"])
     industries = [industry] if industry else settings.get("industries", ["SaaS", "IT Services"])
     errors = []
@@ -877,14 +846,11 @@ async def source_leads(settings: dict, count: int, region=None, industry=None, a
         except Exception as e:
             logger.error(f"Places/Hunter failed: {e}")
             errors.append(f"Places/Hunter: {e}")
-    if not allow_demo:
-        raise RuntimeError(
-            "No real lead source is available — " +
-            (" ".join(errors) if errors else "No lead integrations are connected.") +
-            " Import a CSV of real contacts, or fix your integration access, instead of using demo data."
-        )
-    ai = await generate_leads(settings, count, region, industry)
-    return ai, "ai"
+    raise RuntimeError(
+        "No real lead source is available — " +
+        (" ".join(errors) if errors else "No lead integrations are connected.") +
+        " Connect Apollo or Google Places + Hunter, or import a CSV of real contacts."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1004,19 +970,19 @@ Return ONLY JSON."""
 # Core automation run
 # ---------------------------------------------------------------------------
 async def execute_run(user_id: str, count: int, region=None, industry=None,
-                      offer=None, tone=None, source="manual", allow_demo: bool = False):
+                      offer=None, tone=None, source="manual"):
     settings = await get_or_create_settings(user_id)
     if offer:
         settings = {**settings, "offer": offer}
     if tone:
         settings = {**settings, "tone": tone}
 
-    leads, lead_source = await source_leads(settings, count, region, industry, allow_demo=allow_demo)
+    leads, lead_source = await source_leads(settings, count, region, industry)
     leads = await attach_live_signals(leads)
     leads = await attach_linkedin_drafts(settings, leads)
     has_inbox = bool(await pool.fetchval(
         "SELECT count(*) FROM inboxes WHERE user_id=$1 AND is_active=true", user_id))
-    deliver = (_email_configured() or has_inbox) and lead_source != "ai"
+    deliver = _email_configured() or has_inbox
     emails = await generate_emails(settings, leads)
     email_by_i = {e.get("i"): e for e in emails}
     steps = await get_sequence_steps(user_id)
@@ -1087,7 +1053,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
         # WhatsApp proposal
         if wa:
             wa_body = build_whatsapp_message(lead, sender, settings.get("offer", ""))
-            wa_res = await send_whatsapp(phone, wa_body, allow=(lead_source != "ai"))
+            wa_res = await send_whatsapp(phone, wa_body, allow=True)
             if wa_res["status"] == "sent" and not wa_res.get("simulated"):
                 wa_sent += 1
             await pool.execute("""
@@ -1100,7 +1066,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
                  wa_res.get("simulated", False), wa_res.get("error"), wa, now_dt,
                  now_dt if wa_res["status"] == "sent" else None)
 
-    src_label = {"apollo": "Apollo", "places_hunter": "Google Places + Hunter", "csv": "CSV"}.get(lead_source, "AI")
+    src_label = {"apollo": "Apollo", "places_hunter": "Google Places + Hunter"}.get(lead_source, lead_source)
     await pool.execute("""
         INSERT INTO activity (id, user_id, type, message, created_at)
         VALUES ($1,$2,$3,$4,$5)
@@ -1623,7 +1589,7 @@ async def run_now(data: RunInput, user: dict = Depends(get_current_user)):
     count = max(1, min(data.count, 15))
     try:
         result = await execute_run(tenant_id(user), count, data.region, data.industry, data.offer,
-                                   data.tone, allow_demo=data.allow_demo)
+                                   data.tone)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
     await pool.execute("UPDATE settings SET last_run=$1 WHERE user_id=$2",

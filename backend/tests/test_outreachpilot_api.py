@@ -150,7 +150,14 @@ class TestIntegrationsStatus:
 
 # ---------------- Automation run: drafts + project_idea + estimated_value ----------------
 class TestAutomationRun:
-    """One real LLM run for the whole class (kept small)."""
+    """One real LLM run for the whole class (kept small).
+
+    automation/run only sources real leads now (Apollo / Google Places+Hunter — no
+    fabricated demo fallback), so it isn't guaranteed to produce a lead in a test
+    environment without those integrations configured. Import a CSV row with
+    project_idea/estimated_value instead (real, user-supplied data) and draft
+    emails for it, which exercises the same downstream drafting logic the old
+    demo-data run was actually testing."""
     _did_run = False
     _lead_id = None
     _email_id = None
@@ -158,11 +165,21 @@ class TestAutomationRun:
     def _run_once(self, s):
         if TestAutomationRun._did_run:
             return
-        r = s.post(f"{BASE_URL}/api/automation/run", json={"count": 3, "allow_demo": True}, timeout=180)
+        unique = uuid.uuid4().hex[:8]
+        csv_body = (
+            "company,contact_name,title,email,phone,location,industry,website,"
+            "pain_point,project_idea,estimated_value\n"
+            f"Acme Test Co,Jordan Test,CTO,test_run_{unique}@example.com,,Remote,SaaS,"
+            "https://example.com,Slow manual reporting,Automated reporting dashboard,$4k-$8k\n"
+        )
+        r = s.post(f"{BASE_URL}/api/leads/import",
+                   files={"file": ("leads.csv", csv_body, "text/csv")}, timeout=60)
         assert r.status_code == 200, r.text
-        d = r.json()
-        assert d["leads"] >= 1
-        assert d["emails"] >= 1
+        assert r.json()["imported"] >= 1
+
+        r = s.post(f"{BASE_URL}/api/leads/draft-missing", timeout=180)
+        assert r.status_code == 200, r.text
+        assert r.json()["drafted"] >= 1
         TestAutomationRun._did_run = True
 
     def test_run_creates_drafts_and_project_fields(self):
