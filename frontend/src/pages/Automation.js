@@ -327,6 +327,7 @@ export default function Automation() {
                 { label: "Leads · Apollo", live: integ.leads_live, icon: Radar, hint: integ.leads_live ? "Real leads live" : (integ.leads_blocked ? "Apollo Free plan — upgrade to enable API" : "Add APOLLO_API_KEY") },
                 { label: "Leads · Places+Hunter", live: integ.places_hunter_live, icon: Radar, hint: integ.places_hunter_live ? "Real leads live" : (integ.places_hunter_blocked ? "Check Google Places billing" : "Add GOOGLE_PLACES_API_KEY") },
                 { label: "Leads · Foursquare+Hunter", live: integ.foursquare_hunter_live, icon: Radar, hint: integ.foursquare_hunter_live ? "Real leads live — no billing needed" : (integ.foursquare_hunter_blocked ? "Check Foursquare API key" : "Add FOURSQUARE_API_KEY") },
+                { label: "Leads · GitHub", live: integ.github_live, icon: Radar, hint: integ.github_live ? "Real leads live — tech companies" : (integ.github_blocked ? "Check GitHub token" : "Add GITHUB_API_KEY") },
                 { label: "Leads · OSM+Hunter (free)", live: integ.osm_hunter_live, icon: Radar, hint: integ.osm_hunter_live ? "Real leads live — no billing needed" : "Add HUNTER_API_KEY" },
                 { label: "WhatsApp · Twilio", live: integ.whatsapp_live, icon: MessageCircle, hint: integ.whatsapp_live ? "Auto-send live" : "Add Twilio creds" },
                 { label: "Replies · IMAP", live: integ.reply_detection_live, icon: Inbox, hint: integ.reply_detection_live ? "Auto-stops follow-ups on reply" : "Uses your email login" },
@@ -373,12 +374,12 @@ export default function Automation() {
               </button>
             </div>
             {!integ.leads_live && !integ.places_hunter_live && !integ.foursquare_hunter_live &&
-             !integ.osm_hunter_live && (
+             !integ.github_live && !integ.osm_hunter_live && (
               <p className="text-xs text-amber-400/80 mt-3 leading-relaxed">
                 Note: no real lead source is connected yet, so "Run outreach now" will error until you
-                connect Apollo, Google Places + Hunter, Foursquare + Hunter, or just a free Hunter.io
-                key alone (OpenStreetMap sourcing needs no billing), or import a CSV of real contacts
-                instead.
+                connect Apollo, Google Places + Hunter, Foursquare + Hunter, GitHub, or just a free
+                Hunter.io key alone (OpenStreetMap sourcing needs no billing), or import a CSV of real
+                contacts instead.
               </p>
             )}
           </div>

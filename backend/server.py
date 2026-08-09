@@ -76,6 +76,7 @@ APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY", "").strip()
 HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "").strip()
 GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
 FOURSQUARE_API_KEY = os.environ.get("FOURSQUARE_API_KEY", "").strip()
+GITHUB_API_KEY = os.environ.get("GITHUB_API_KEY", "").strip()
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()
@@ -131,6 +132,8 @@ async def integrations_status(user_id: str = None) -> dict:
         "places_hunter_blocked": bool(HUNTER_API_KEY and GOOGLE_PLACES_API_KEY) and _places_hunter_ok is False,
         "foursquare_hunter_live": bool(HUNTER_API_KEY and FOURSQUARE_API_KEY) and _foursquare_hunter_ok is not False,
         "foursquare_hunter_blocked": bool(HUNTER_API_KEY and FOURSQUARE_API_KEY) and _foursquare_hunter_ok is False,
+        "github_live": bool(GITHUB_API_KEY) and _github_ok is not False,
+        "github_blocked": bool(GITHUB_API_KEY) and _github_ok is False,
         "osm_hunter_live": bool(HUNTER_API_KEY) and _osm_hunter_ok is not False,
         "osm_hunter_blocked": bool(HUNTER_API_KEY) and _osm_hunter_ok is False,
         "whatsapp_live": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM),
@@ -895,6 +898,83 @@ async def fetch_foursquare_hunter_leads(regions, industries, count) -> List[dict
 
 
 # ---------------------------------------------------------------------------
+# Real lead sourcing via GitHub organizations (free, instant personal access
+# token — no approval process, no billing) + Hunter.io as a fallback when an
+# org doesn't list an email directly. Best fit for tech/software/SaaS targets
+# specifically, since it only surfaces companies with a public GitHub org.
+# ---------------------------------------------------------------------------
+_github_ok = None  # None=untested, True=working, False=blocked
+_GITHUB_API_VERSION = "2026-03-10"  # dated API-contract pin; bump if GitHub sunsets this version
+
+async def fetch_github_companies(regions, industries, limit) -> List[dict]:
+    companies = []
+    keyword = industries[0] if industries else ""
+    headers = {"Authorization": f"Bearer {GITHUB_API_KEY}", "Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": _GITHUB_API_VERSION}
+    async with httpx.AsyncClient(timeout=20) as c:
+        for region in regions:
+            if len(companies) >= limit:
+                break
+            query = f'type:org location:"{region}"' + (f" {keyword}" if keyword else "")
+            resp = await c.get("https://api.github.com/search/users",
+                               params={"q": query, "per_page": min(limit * 3, 30)}, headers=headers)
+            if resp.is_error:
+                raise RuntimeError(f"GitHub search error {resp.status_code}")
+            for item in resp.json().get("items", []):
+                if len(companies) >= limit:
+                    break
+                org_resp = await c.get(f"https://api.github.com/orgs/{item['login']}", headers=headers)
+                if org_resp.is_error:
+                    continue
+                org = org_resp.json()
+                blog = (org.get("blog") or "").strip()
+                website = blog if blog.startswith("http") else (f"https://{blog}" if blog else "")
+                email = (org.get("email") or "").strip()
+                if not website and not email:
+                    continue  # nothing to reach them at or look a contact up with — skip
+                companies.append({
+                    "company": org.get("name") or org.get("login", ""),
+                    "website": website, "email": email, "phone": "",
+                    "location": org.get("location") or region, "industry": keyword,
+                })
+    return companies
+
+async def fetch_github_leads(regions, industries, count) -> List[dict]:
+    global _github_ok
+    companies = await fetch_github_companies(regions, industries, count * 4)
+    leads = []
+    for comp in companies:
+        if len(leads) >= count:
+            break
+        if comp["email"]:
+            # Org lists a contact email directly — no Hunter lookup needed.
+            leads.append({
+                "company": comp["company"], "contact_name": "", "title": "",
+                "email": comp["email"], "phone": "", "location": comp["location"],
+                "industry": comp["industry"], "website": comp["website"], "pain_point": "",
+            })
+            continue
+        if not comp["website"] or not HUNTER_API_KEY:
+            continue
+        domain = _domain_from_url(comp["website"])
+        try:
+            contact = await fetch_hunter_contact(domain)
+        except Exception as e:
+            logger.warning(f"Hunter lookup failed for {domain}: {e}")
+            continue
+        if not contact:
+            continue
+        leads.append({
+            "company": comp["company"], "contact_name": contact["contact_name"],
+            "title": contact["title"], "email": contact["email"], "phone": "",
+            "location": comp["location"], "industry": comp["industry"],
+            "website": comp["website"], "pain_point": "",
+        })
+    _github_ok = True
+    return leads
+
+
+# ---------------------------------------------------------------------------
 # Real lead sourcing via OpenStreetMap (free, no API key or billing) + Hunter.io.
 # Third real source — works even without a Google Cloud billing account, at
 # the cost of coarser business categorization than Places (OSM's "office" tag
@@ -1020,6 +1100,15 @@ async def source_leads(settings: dict, count: int, region=None, industry=None):
         except Exception as e:
             logger.error(f"Foursquare/Hunter failed: {e}")
             errors.append(f"Foursquare/Hunter: {e}")
+    if GITHUB_API_KEY:
+        try:
+            leads = await fetch_github_leads(regions, industries, count)
+            if leads:
+                return leads, "github"
+            errors.append("GitHub found no matching organizations for your current filters.")
+        except Exception as e:
+            logger.error(f"GitHub failed: {e}")
+            errors.append(f"GitHub: {e}")
     if HUNTER_API_KEY:
         try:
             leads = await fetch_osm_hunter_leads(regions, industries, count)
@@ -1032,7 +1121,7 @@ async def source_leads(settings: dict, count: int, region=None, industry=None):
     raise RuntimeError(
         "No real lead source is available — " +
         (" ".join(errors) if errors else "No lead integrations are connected.") +
-        " Connect Apollo, Google Places + Hunter, Foursquare + Hunter, or just Hunter alone "
+        " Connect Apollo, Google Places + Hunter, Foursquare + Hunter, GitHub, or just Hunter alone "
         "(free OpenStreetMap sourcing), or import a CSV of real contacts."
     )
 
@@ -1252,7 +1341,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
                  now_dt if wa_res["status"] == "sent" else None)
 
     src_label = {"apollo": "Apollo", "places_hunter": "Google Places + Hunter",
-                "foursquare_hunter": "Foursquare + Hunter",
+                "foursquare_hunter": "Foursquare + Hunter", "github": "GitHub",
                 "osm_hunter": "OpenStreetMap + Hunter"}.get(lead_source, lead_source)
     await pool.execute("""
         INSERT INTO activity (id, user_id, type, message, created_at)

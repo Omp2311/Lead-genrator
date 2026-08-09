@@ -26,6 +26,7 @@ const SOURCE_LABELS = {
   apollo: "Apollo",
   places_hunter: "Places + Hunter",
   foursquare_hunter: "Foursquare + Hunter",
+  github: "GitHub",
   osm_hunter: "OpenStreetMap + Hunter",
   csv: "CSV import",
 };
