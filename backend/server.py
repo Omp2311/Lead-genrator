@@ -1013,6 +1013,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
 
     leads, lead_source = await source_leads(settings, count, region, industry, allow_demo=allow_demo)
     leads = await attach_live_signals(leads)
+    leads = await attach_linkedin_drafts(settings, leads)
     has_inbox = bool(await pool.fetchval(
         "SELECT count(*) FROM inboxes WHERE user_id=$1 AND is_active=true", user_id))
     deliver = (_email_configured() or has_inbox) and lead_source != "ai"
@@ -1042,13 +1043,15 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
         await pool.execute("""
             INSERT INTO leads (id, user_id, company, contact_name, title, email, phone, location,
                                 industry, website, pain_point, project_idea, estimated_value,
-                                whatsapp_link, created_at, source, lead_source, replied, suppressed)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,false,$18)
+                                whatsapp_link, created_at, source, lead_source, replied, suppressed,
+                                linkedin_note, linkedin_message)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,false,$18,$19,$20)
         """, lead_id, user_id, lead.get("company", ""), lead.get("contact_name", ""),
              lead.get("title", ""), to_email, phone, lead.get("location", ""),
              lead.get("industry", ""), lead.get("website", ""), lead.get("pain_point", ""),
              lead.get("project_idea", ""), lead.get("estimated_value", ""), wa, now_dt,
-             source, lead_source, suppressed_lead)
+             source, lead_source, suppressed_lead,
+             lead.get("linkedin_note", ""), lead.get("linkedin_message", ""))
         created_leads += 1
 
         em = email_by_i.get(idx, {})
@@ -1288,9 +1291,10 @@ Return JSON: {{"subject": "...", "body": "..."}}. Return ONLY JSON."""
 
 
 # ---------------------------------------------------------------------------
-# LinkedIn outreach drafting — text only, for the user to copy-paste themselves.
-# Deliberately NOT automated: LinkedIn's ToS prohibits automating a personal
-# account, and doing so risks the user's account being banned.
+# LinkedIn outreach drafting — the note + first message are written automatically
+# for every new lead, but sending is deliberately NOT automated: LinkedIn's ToS
+# prohibits automating actions on a personal account, and doing so risks the
+# user's account being banned. The user still copy-pastes the draft themselves.
 # ---------------------------------------------------------------------------
 async def generate_linkedin_message(settings: dict, lead: dict) -> dict:
     sender = settings.get("sender_name", "Alex")
@@ -1308,6 +1312,22 @@ Both end with "{sender}".
 Return JSON: {{"connection_note": "...", "first_message": "..."}}. Return ONLY JSON."""
     raw = await llm_call(system, prompt)
     return _extract_json(raw)
+
+async def attach_linkedin_drafts(settings: dict, leads: List[dict]) -> List[dict]:
+    """Best-effort: pre-write the LinkedIn note + first message for each named lead, so
+    there's a ready-to-paste draft waiting instead of a manual per-lead 'Draft' click.
+    Still text only — the user still copy-pastes it into LinkedIn themselves."""
+    async def _one(lead):
+        if not lead.get("contact_name"):
+            return lead
+        try:
+            draft = await generate_linkedin_message(settings, lead)
+            lead["linkedin_note"] = draft.get("connection_note", "")
+            lead["linkedin_message"] = draft.get("first_message", "")
+        except Exception as e:
+            logger.warning(f"Auto LinkedIn draft failed for {lead.get('company')}: {e}")
+        return lead
+    return list(await asyncio.gather(*[_one(l) for l in leads]))
 
 
 # ---------------------------------------------------------------------------
