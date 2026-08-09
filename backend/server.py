@@ -429,15 +429,25 @@ async def generate_emails(settings: dict, leads: List[dict]):
                     f'alternative to proposing a call time yourself.' if meeting_link else "")
     prompt = f"""Write a personalized cold email for each prospect below.
 Sender name: {sender}. Offer: {offer}. Tone: {tone}.
-Rules: <=120 words, one clear CTA (a 15-min call), reference their pain_point naturally,
-and pitch the specific "project_idea" as what you could build for them. If "live_signal" is
-non-empty for a prospect, it's a real, current snippet pulled from their own website — weave
-in one specific detail from it naturally if it fits; ignore it if it doesn't add anything
-concrete. No fluff, no "I hope this finds you well", no clickbait subject lines, and never
-invent statistics, client results, or case studies that weren't given to you — the only claims
-you can make are the pain_point and project_idea provided. Use plain straight quotes/apostrophes
-and hyphens only — no smart quotes or em-dashes. Subject line <=6 words, matching each
-prospect's "subject_style".{meeting_note}
+Rules: <=120 words, one clear CTA (a 15-min call).
+- If "pain_point" or "project_idea" is non-empty, reference it naturally and pitch the
+  project_idea as what you could build for them.
+- If "live_signal" is non-empty, it's a real, current snippet pulled from their own website —
+  weave in one specific detail from it if it fits; ignore it if it doesn't add anything concrete.
+- If pain_point, project_idea, AND live_signal are ALL empty, you have no real information about
+  this prospect beyond their name, title, company, and industry — do NOT invent a specific pain
+  point, need, or use case for them, and do not imply you've researched them or their company.
+  Instead write a SHORT (<=60 words) email: one line introducing the offer in plain terms, one
+  genuine open-ended question about their role/industry that a real person would ask, and the
+  call-to-action. Never use vague claim-of-expertise words with nothing concrete behind them —
+  "revolutionize", "streamline", "tailored", "customized", "cutting-edge", "intelligent solution",
+  "seamless" — these read as generic and unresearched, which is worse than being brief and
+  honestly curious instead.
+No fluff, no "I hope this finds you well", no clickbait subject lines, and never invent
+statistics, client results, or case studies that weren't given to you — the only claims you can
+make are the pain_point and project_idea provided. Use plain straight quotes/apostrophes and
+hyphens only — no smart quotes or em-dashes. Subject line <=6 words, matching each prospect's
+"subject_style".{meeting_note}
 Prospects: {json.dumps(compact)}
 Return a JSON array where each item has: "i" (matching index), "subject", "body".
 Body should use \\n for line breaks and end with "{sender}". Return ONLY JSON."""
@@ -1164,7 +1174,7 @@ async def fetch_company_signal(website: str) -> str:
     if not _resolves_to_public_address(url):
         return ""
     try:
-        async with httpx.AsyncClient(timeout=6, follow_redirects=True) as c:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
             resp = await c.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; OutreachPilotBot/1.0)"})
         if resp.is_error:
             return ""
@@ -1233,8 +1243,10 @@ Sender: {sender}. Offer: {offer}.
 {proof_rule}
 Never invent statistics, client results, or case studies beyond what's listed above — the only
 claims you can make are the pain_point, title, and industry given below, plus the verified result(s)
-above if any were given. Use plain straight quotes/apostrophes and hyphens only — no smart quotes
-or em-dashes.
+above if any were given. If a prospect's "pain_point" is empty, don't invent one — keep that
+follow-up brief and about the offer/CTA itself (e.g. "still worth a quick call?") rather than
+guessing at a specific need. Use plain straight quotes/apostrophes and hyphens only — no smart
+quotes or em-dashes.
 All end with "{sender}". Subjects <=5 words, can start with "Re:".
 Prospects: {json.dumps(compact)}
 Return a JSON array where each item is {{"i": <index>, "followups": [{{"subject","body"}}, ...]}}
