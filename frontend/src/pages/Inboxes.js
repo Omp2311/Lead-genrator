@@ -10,6 +10,9 @@ import {
   Trash2,
   Flame,
   Circle,
+  ShieldCheck,
+  ShieldAlert,
+  RefreshCw,
 } from "lucide-react";
 
 const EMPTY_FORM = {
@@ -26,10 +29,43 @@ const EMPTY_FORM = {
   is_active: true,
 };
 
+function DeliverabilityBadge({ label, ok, checked }) {
+  if (!checked) {
+    return (
+      <span className="flex items-center gap-1 text-zinc-500">
+        <Circle className="w-2 h-2 fill-zinc-600 text-zinc-600" /> {label} not checked
+      </span>
+    );
+  }
+  return ok ? (
+    <span className="flex items-center gap-1 text-emerald-400">
+      <ShieldCheck className="w-3.5 h-3.5" /> {label} OK
+    </span>
+  ) : (
+    <span className="flex items-center gap-1 text-amber-400">
+      <ShieldAlert className="w-3.5 h-3.5" /> {label} missing
+    </span>
+  );
+}
+
 function InboxCard({ inbox, onChanged }) {
   const [testing, setTesting] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [togglingActive, setTogglingActive] = useState(false);
+  const [checking, setChecking] = useState(false);
+
+  const recheckDeliverability = async () => {
+    setChecking(true);
+    try {
+      await api.post(`/inboxes/${inbox.id}/check-deliverability`);
+      toast.success("Deliverability re-checked.");
+      onChanged();
+    } catch (e) {
+      toast.error("Could not check deliverability.");
+    } finally {
+      setChecking(false);
+    }
+  };
 
   const test = async () => {
     setTesting(true);
@@ -95,7 +131,7 @@ function InboxCard({ inbox, onChanged }) {
         </span>
       </div>
 
-      <div className="flex items-center gap-4 mt-4 text-xs text-zinc-400">
+      <div className="flex flex-wrap items-center gap-4 mt-4 text-xs text-zinc-400">
         <span>
           Sent today: <span className="text-zinc-200 font-mono">{inbox.sent_today || 0}</span> / {inbox.daily_cap}
         </span>
@@ -104,6 +140,19 @@ function InboxCard({ inbox, onChanged }) {
             <Flame className="w-3.5 h-3.5" /> Warming up
           </span>
         )}
+      </div>
+
+      <div className="flex flex-wrap items-center gap-4 mt-2 text-xs" data-testid={`inbox-deliverability-${inbox.id}`}>
+        <DeliverabilityBadge label="SPF" ok={inbox.spf_ok} checked={!!inbox.deliverability_checked_at} />
+        <DeliverabilityBadge label="DMARC" ok={inbox.dmarc_ok} checked={!!inbox.deliverability_checked_at} />
+        <button
+          onClick={recheckDeliverability}
+          disabled={checking}
+          data-testid={`inbox-recheck-${inbox.id}`}
+          className="flex items-center gap-1 text-zinc-500 hover:text-cyan-400 transition-colors disabled:opacity-60"
+        >
+          {checking ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />} Recheck
+        </button>
       </div>
 
       <div className="flex flex-wrap gap-2 mt-4">

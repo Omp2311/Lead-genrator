@@ -443,7 +443,7 @@ async def generate_emails(settings: dict, leads: List[dict]):
     compact = [{"i": idx, "company": l.get("company"), "contact_name": l.get("contact_name"),
                 "title": l.get("title"), "pain_point": l.get("pain_point"),
                 "project_idea": l.get("project_idea"), "industry": l.get("industry"),
-                "live_signal": l.get("live_signal") or "",
+                "live_signal": l.get("live_signal") or "", "location": l.get("location") or "",
                 "subject_style": style_by_variant[subject_variant(idx)]}
                for idx, l in enumerate(leads)]
     meeting_note = (f'\nA booking link is available ({meeting_link}) — you may offer it as an '
@@ -490,6 +490,8 @@ One clear CTA (a 15-min call) in the closing paragraph only.
   project_idea as what you could build for them.
 - If "live_signal" is non-empty, it's a real, current snippet pulled from their own website —
   weave in one specific detail from it if it fits; ignore it if it doesn't add anything concrete.
+- If "location" is non-empty, you may reference it naturally (e.g. shared region/timezone) if it
+  adds something real — never fabricate familiarity with a place you don't actually share.
 - If pain_point, project_idea, AND live_signal are ALL empty, you don't know anything about this
   specific company — but you can still speak honestly to a real, well-known challenge common to
   their industry as a whole (e.g. for auditing firms: manual documentation and close-season
@@ -597,6 +599,20 @@ def _inbox_to_cfg(inbox: dict) -> dict:
             "smtp_user": inbox["smtp_user"], "smtp_password": inbox["smtp_password"],
             "from_email": inbox["from_email"]}
 
+async def resolve_sender_cfg(user_id: str):
+    """(inbox, cfg, defer_reason). If the user has zero configured inboxes, falls back to the
+    legacy env sender (existing documented behavior for that case). If the user HAS inboxes but
+    all are at today's daily-cap/warm-up limit, defer_reason is set and cfg is None — callers
+    must NOT fall back to the uncapped legacy sender in that case, or the cap is meaningless."""
+    inbox = await pick_inbox(user_id)
+    if inbox:
+        return inbox, _inbox_to_cfg(inbox), None
+    has_inbox = bool(await pool.fetchval(
+        "SELECT count(*) FROM inboxes WHERE user_id=$1 AND is_active=true", user_id))
+    if has_inbox:
+        return None, None, "All configured inboxes are at today's daily cap/warm-up limit."
+    return None, _default_email_cfg(), None
+
 async def record_inbox_send(inbox_id: str):
     today = date.today()
     row = rec(await pool.fetchrow("SELECT sent_today, sent_today_date FROM inboxes WHERE id=$1", inbox_id))
@@ -655,6 +671,24 @@ def spam_score(subject: str, body: str) -> dict:
 
     score = max(0, min(100, score))
     return {"score": score, "flags": flags}
+
+
+def _dns_txt_records(name: str) -> List[str]:
+    """Read-only DNS TXT lookup — free, no API key. Empty list on any failure (NXDOMAIN,
+    timeout, no records)."""
+    import dns.resolver
+    try:
+        return [r.to_text().strip('"') for r in dns.resolver.resolve(name, "TXT", lifetime=3)]
+    except Exception:
+        return []
+
+async def check_domain_deliverability(domain: str) -> dict:
+    """SPF/DMARC presence for a sending domain. Blocking DNS lookups, so run off the event loop."""
+    def _check():
+        spf = any(t.lower().startswith("v=spf1") for t in _dns_txt_records(domain))
+        dmarc = any(t.lower().startswith("v=dmarc1") for t in _dns_txt_records(f"_dmarc.{domain}"))
+        return {"spf_ok": spf, "dmarc_ok": dmarc}
+    return await asyncio.to_thread(_check)
 
 
 # ---------------------------------------------------------------------------
@@ -747,6 +781,27 @@ async def send_whatsapp(to_phone: str, body: str, allow: bool = True) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Lead targeting exclusions — businesses that are a poor fit as customers, not
+# just unrelated to the search. Marketing/ad/PR/consulting firms typically sell
+# services themselves rather than buy custom software, so they're excluded from
+# every real lead source at discovery time (before Hunter lookups spend credits
+# on them). Deliberately NOT a bare "agency" match — travel agencies, insurance
+# agencies, real estate agencies, staffing agencies etc. are legitimate customer
+# types for other offers (e.g. a travel-ops product prospecting travel agencies)
+# and would be wrongly excluded by a broader substring match.
+# ---------------------------------------------------------------------------
+_EXCLUDED_BUSINESS_TERMS = (
+    "marketing agency", "advertising agency", "ad agency", "digital agency",
+    "pr agency", "public relations agency", "branding agency", "creative agency",
+    "consult",  # catches consulting/consultancy/consultant
+)
+
+def _is_excluded_business(company: str, industry: str) -> bool:
+    text = f"{company} {industry}".lower()
+    return any(term in text for term in _EXCLUDED_BUSINESS_TERMS)
+
+
+# ---------------------------------------------------------------------------
 # Real lead sourcing via Apollo (falls back to AI demo leads)
 # ---------------------------------------------------------------------------
 async def fetch_apollo_leads(regions, industries, count) -> List[dict]:
@@ -797,14 +852,18 @@ async def fetch_apollo_leads(regions, industries, count) -> List[dict]:
             if pn.get("sanitized_number"):
                 phone = pn["sanitized_number"]
                 break
+        company_name = org.get("name") or p.get("organization_name") or ""
+        lead_industry = industries[0] if industries else ""
+        if _is_excluded_business(company_name, lead_industry):
+            continue
         leads.append({
-            "company": org.get("name") or p.get("organization_name") or "",
+            "company": company_name,
             "contact_name": " ".join(x for x in [p.get("first_name"), p.get("last_name")] if x),
             "title": p.get("title") or "",
             "email": m.get("email") or "",
             "phone": phone,
             "location": ", ".join(x for x in [p.get("city"), p.get("state"), p.get("country")] if x),
-            "industry": (industries[0] if industries else ""),
+            "industry": lead_industry,
             "website": org.get("website_url") or (("https://" + org["primary_domain"]) if org.get("primary_domain") else ""),
             "pain_point": "",
         })
@@ -853,8 +912,11 @@ async def fetch_places_companies(regions, industries, limit) -> List[dict]:
                     website = d.get("website")
                     if not website:
                         continue  # no domain to look up real contacts at — skip
+                    company_name = d.get("name") or place.get("name") or ""
+                    if _is_excluded_business(company_name, industry):
+                        continue
                     companies.append({
-                        "company": d.get("name") or place.get("name") or "",
+                        "company": company_name,
                         "website": website,
                         "phone": d.get("international_phone_number") or d.get("formatted_phone_number") or "",
                         "location": d.get("formatted_address") or region,
@@ -943,8 +1005,11 @@ async def fetch_foursquare_companies(regions, industries, limit) -> List[dict]:
                 cats = place.get("categories") or []
                 real_category = cats[0].get("name") if cats else None
                 industry = real_category if real_category and real_category != "Office" else keyword
+                company_name = place.get("name", "")
+                if _is_excluded_business(company_name, industry):
+                    continue
                 companies.append({
-                    "company": place.get("name", ""),
+                    "company": company_name,
                     "website": website,
                     "phone": place.get("tel", ""),
                     "location": loc.get("formatted_address") or region,
@@ -1014,11 +1079,15 @@ async def fetch_github_companies(regions, industries, limit) -> List[dict]:
                 email = (org.get("email") or "").strip()
                 if not website and not email:
                     continue  # nothing to reach them at or look a contact up with — skip
+                company_name = org.get("name") or org.get("login", "")
+                description = org.get("description") or ""
+                if _is_excluded_business(f"{company_name} {description}", ""):
+                    continue
                 region_matches.append({
-                    "company": org.get("name") or org.get("login", ""),
+                    "company": company_name,
                     "website": website, "email": email, "phone": "",
                     "location": org.get("location") or region, "industry": industries[0] if industries else "",
-                    "_text": f"{org.get('name', '')} {org.get('description', '')}".lower(),
+                    "_text": f"{company_name} {description}".lower(),
                 })
             if keyword:
                 region_matches.sort(key=lambda m: 0 if keyword in m["_text"] else 1)
@@ -1117,6 +1186,8 @@ async def fetch_osm_companies(regions, industries, limit) -> List[dict]:
                 if not name or not website:
                     continue
                 office_tag = (tags.get("office") or "").lower()
+                if _is_excluded_business(name, office_tag):
+                    continue
                 region_matches.append({
                     "company": name,
                     "website": website,
@@ -1226,7 +1297,10 @@ async def source_leads(settings: dict, count: int, region=None, industry=None):
 # homepage instead of relying purely on LLM invention.
 # ---------------------------------------------------------------------------
 def _clean_html_text(raw: str) -> str:
-    text = html_lib.unescape(raw)
+    # Strip nested tags first (harmless no-op for <title>/meta content, which are always plain,
+    # but real-world <h1> content often has inline <span>/<strong>/<br> markup inside it).
+    text = re.sub(r"<[^>]+>", " ", raw)
+    text = html_lib.unescape(text)
     return re.sub(r"\s+", " ", text).strip()
 
 def _resolves_to_public_address(url: str) -> bool:
@@ -1258,7 +1332,18 @@ async def fetch_company_signal(website: str) -> str:
         page = resp.text[:20000]
         title_m = re.search(r"<title[^>]*>(.*?)</title>", page, re.I | re.S)
         desc_m = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']*)', page, re.I)
-        parts = [_clean_html_text(m.group(1)) for m in (title_m, desc_m) if m and m.group(1).strip()]
+        # Many sites omit the plain meta description but keep an OpenGraph one for social
+        # previews — use it as a fallback, not a replacement, since when both exist the plain
+        # one is usually the more literal company description.
+        og_desc_m = None
+        if not desc_m:
+            og_desc_m = re.search(
+                r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']*)', page, re.I)
+        # A homepage's H1 is often the clearest one-line statement of what a company actually
+        # does — frequently more concrete than a generic <title> tag.
+        h1_m = re.search(r"<h1[^>]*>(.*?)</h1>", page, re.I | re.S)
+        parts = [_clean_html_text(m.group(1)) for m in (title_m, desc_m or og_desc_m, h1_m)
+                 if m and m.group(1).strip()]
         return " — ".join(parts)[:300]
     except Exception as e:
         logger.warning(f"Live-signal fetch failed for {website}: {e}")
@@ -1411,17 +1496,18 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
         em = email_by_i.get(idx, {})
         subject = em.get("subject", "Quick question")
         body = em.get("body", "")
+        spam = spam_score(subject, body)
         # Emails are created as editable DRAFTS — user sends them from the Outbox.
         # Suppressed (unsubscribed) recipients get a distinct status and no follow-ups.
         await pool.execute("""
             INSERT INTO emails (id, user_id, lead_id, company, contact_name, to_email, subject, body,
                                  channel, step, type, status, simulated, error, created_at,
-                                 deliverable, lead_source, sent_at, variant)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'email',1,'initial',$9,false,NULL,$10,$11,$12,NULL,$13)
+                                 deliverable, lead_source, sent_at, variant, spam_score, spam_flags)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'email',1,'initial',$9,false,NULL,$10,$11,$12,NULL,$13,$14,$15)
         """, str(uuid.uuid4()), user_id, lead_id, lead.get("company", ""),
              lead.get("contact_name", ""), to_email, subject, body,
              "suppressed" if suppressed_lead else "draft", now_dt, deliver, lead_source,
-             subject_variant(idx))
+             subject_variant(idx), spam["score"], spam["flags"])
         created_emails += 1
 
         # Schedule follow-ups (sent later if the lead hasn't replied) — skipped for suppressed leads
@@ -1509,15 +1595,16 @@ async def draft_emails_for_leads(user_id: str) -> dict:
         em = email_by_i.get(idx, {})
         subject = em.get("subject", "Quick question")
         body = em.get("body", "")
+        spam = spam_score(subject, body)
         await pool.execute("""
             INSERT INTO emails (id, user_id, lead_id, company, contact_name, to_email, subject, body,
                                  channel, step, type, status, simulated, error, created_at,
-                                 deliverable, lead_source, sent_at, variant)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'email',1,'initial',$9,false,NULL,$10,$11,$12,NULL,$13)
+                                 deliverable, lead_source, sent_at, variant, spam_score, spam_flags)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'email',1,'initial',$9,false,NULL,$10,$11,$12,NULL,$13,$14,$15)
         """, str(uuid.uuid4()), user_id, lead_id, lead.get("company", ""),
              lead.get("contact_name", ""), to_email, subject, body,
              "suppressed" if suppressed_lead else "draft", now_dt, deliver, lead_source,
-             subject_variant(idx))
+             subject_variant(idx), spam["score"], spam["flags"])
         drafted += 1
 
         if not suppressed_lead:
@@ -1574,8 +1661,9 @@ async def process_due_followups(user_id: str = None) -> int:
             await pool.execute("UPDATE emails SET status='cancelled' WHERE id=$1", fu["id"])
             continue
         fu_user_id = fu.get("user_id")
-        inbox = await pick_inbox(fu_user_id)
-        cfg = _inbox_to_cfg(inbox) if inbox else None
+        inbox, cfg, defer_reason = await resolve_sender_cfg(fu_user_id)
+        if defer_reason:
+            continue  # leave status='scheduled' — retried next tick once cap resets
         result = await send_email(fu.get("to_email", ""), fu.get("subject", ""),
                                   fu.get("body", ""), allow=fu.get("deliverable", False),
                                   user_id=fu_user_id, email_id=fu["id"], cfg=cfg)
@@ -1772,8 +1860,19 @@ async def scan_replies(user_id: str = None) -> dict:
         addr = (lead.get("email") or "").lower()
         if addr in replies:
             intent = await classify_reply_intent(replies[addr])
+            reply_time = datetime.now(timezone.utc)
             await pool.execute(
-                "UPDATE leads SET replied=true, reply_intent=$2 WHERE id=$1", lead["id"], intent)
+                "UPDATE leads SET replied=true, replied_at=$2, reply_intent=$3 WHERE id=$1",
+                lead["id"], reply_time, intent)
+            # Attribution for analytics: mark the most recently sent email for this lead. Not
+            # necessarily the initial email — funnel breakdowns join back to the initial row's
+            # variant/lead_source via leads.replied_at instead, since a reply can arrive after a
+            # follow-up whose own row has no A/B variant.
+            await pool.execute("""
+                UPDATE emails SET replied_at=$2 WHERE id = (
+                    SELECT id FROM emails WHERE lead_id=$1 AND channel='email' AND status='sent'
+                    ORDER BY sent_at DESC LIMIT 1)
+            """, lead["id"], reply_time)
             await advance_stage(lead["id"], "replied", from_stages=("new", "contacted"))
             await pool.execute(
                 "UPDATE emails SET status='cancelled' WHERE lead_id=$1 AND type='follow_up' AND status='scheduled'",
@@ -1963,8 +2062,9 @@ async def integrations(user: dict = Depends(get_current_user)):
 
 @api_router.post("/integrations/test-email")
 async def test_email(user: dict = Depends(get_current_user)):
-    inbox = await pick_inbox(tenant_id(user))
-    cfg = _inbox_to_cfg(inbox) if inbox else None
+    inbox, cfg, defer_reason = await resolve_sender_cfg(tenant_id(user))
+    if defer_reason:
+        raise HTTPException(status_code=429, detail=defer_reason)
     result = await send_email(user["email"],
                               "OutreachPilot — test email ✅",
                               f"Hi {user.get('name','there')},\n\nYour email delivery is working. "
@@ -2096,10 +2196,12 @@ async def _send_one_email(em: dict, user_id: str) -> dict:
                             "business. Connect Apollo (Settings > Integrations) or import a CSV of "
                             "real contacts to send to actual prospects.")}
     else:
-        inbox = await pick_inbox(user_id)
-        cfg = _inbox_to_cfg(inbox) if inbox else None
-        result = await send_email(to_email, em.get("subject", ""), em.get("body", ""), allow=True,
-                                  user_id=user_id, email_id=em["id"], cfg=cfg)
+        inbox, cfg, defer_reason = await resolve_sender_cfg(user_id)
+        if defer_reason:
+            result = {"status": "failed", "error": defer_reason, "simulated": False}
+        else:
+            result = await send_email(to_email, em.get("subject", ""), em.get("body", ""), allow=True,
+                                      user_id=user_id, email_id=em["id"], cfg=cfg)
     now = datetime.now(timezone.utc)
     await pool.execute(
         "UPDATE emails SET status=$1, simulated=$2, error=$3, sent_at=$4, inbox_id=$5 WHERE id=$6",
@@ -2234,13 +2336,33 @@ async def analytics_funnel(user: dict = Depends(get_current_user)):
         "SELECT count(*) FROM emails WHERE user_id=$1 AND channel='email' AND status='sent' AND open_count>0", uid)
     clicked = await pool.fetchval(
         "SELECT count(*) FROM emails WHERE user_id=$1 AND channel='email' AND status='sent' AND click_count>0", uid)
+    replied = await pool.fetchval(
+        "SELECT count(*) FROM leads WHERE user_id=$1 AND replied_at IS NOT NULL", uid)
     ab_variants = recs(await pool.fetch("""
         SELECT variant, count(*) AS sent, count(*) FILTER (WHERE open_count > 0) AS opened
         FROM emails WHERE user_id=$1 AND channel='email' AND status='sent' AND variant IS NOT NULL
         GROUP BY variant ORDER BY variant
     """, uid))
-    return {"sent": sent, "opened": opened, "clicked": clicked, "stages": stage_counts,
-            "ab_variants": ab_variants}
+    # Attribute replies to the INITIAL email's variant/lead_source via the lead-level flag, not
+    # emails.replied_at directly — a reply can arrive after a follow-up (variant IS NULL on that
+    # row), so joining the lead's replied_at back onto the type='initial' row answers the real
+    # question: "did a lead who got subject A ever reply", not just "did this exact row get one."
+    reply_by_variant = recs(await pool.fetch("""
+        SELECT e.variant, count(*) AS sent, count(*) FILTER (WHERE l.replied_at IS NOT NULL) AS replied
+        FROM emails e JOIN leads l ON l.id = e.lead_id
+        WHERE e.user_id=$1 AND e.channel='email' AND e.status='sent' AND e.type='initial'
+              AND e.variant IS NOT NULL
+        GROUP BY e.variant ORDER BY e.variant
+    """, uid))
+    reply_by_source = recs(await pool.fetch("""
+        SELECT e.lead_source, count(*) AS sent, count(*) FILTER (WHERE l.replied_at IS NOT NULL) AS replied
+        FROM emails e JOIN leads l ON l.id = e.lead_id
+        WHERE e.user_id=$1 AND e.channel='email' AND e.status='sent' AND e.type='initial'
+        GROUP BY e.lead_source ORDER BY e.lead_source
+    """, uid))
+    return {"sent": sent, "opened": opened, "clicked": clicked, "replied": replied,
+            "stages": stage_counts, "ab_variants": ab_variants,
+            "reply_by_variant": reply_by_variant, "reply_by_source": reply_by_source}
 
 
 # ---------------------------------------------------------------------------
@@ -2328,6 +2450,15 @@ async def list_inboxes(user: dict = Depends(get_current_user)):
         "SELECT * FROM inboxes WHERE user_id=$1 ORDER BY created_at", tenant_id(user)))
     return [_inbox_public(r) for r in rows]
 
+async def _run_and_store_deliverability_check(inbox_id: str, from_email: str):
+    domain = (from_email.split("@")[-1] or "").strip().lower()
+    if not domain:
+        return
+    result = await check_domain_deliverability(domain)
+    await pool.execute(
+        "UPDATE inboxes SET spf_ok=$1, dmarc_ok=$2, deliverability_checked_at=$3 WHERE id=$4",
+        result["spf_ok"], result["dmarc_ok"], datetime.now(timezone.utc), inbox_id)
+
 @api_router.post("/inboxes")
 async def create_inbox(data: InboxInput, user: dict = Depends(get_current_user)):
     tid = tenant_id(user)
@@ -2343,7 +2474,9 @@ async def create_inbox(data: InboxInput, user: dict = Depends(get_current_user))
     """, str(uuid.uuid4()), tid, data.label, data.provider, data.smtp_host, data.smtp_port,
          data.smtp_user, data.smtp_password, data.resend_api_key, data.from_email, data.daily_cap,
          data.warmup_enabled, data.is_active)
-    return _inbox_public(rec(row))
+    inbox = rec(row)
+    await _run_and_store_deliverability_check(inbox["id"], data.from_email)
+    return _inbox_public(rec(await pool.fetchrow("SELECT * FROM inboxes WHERE id=$1", inbox["id"])))
 
 @api_router.put("/inboxes/{inbox_id}")
 async def update_inbox(inbox_id: str, data: InboxInput, user: dict = Depends(get_current_user)):
@@ -2361,6 +2494,9 @@ async def update_inbox(inbox_id: str, data: InboxInput, user: dict = Depends(get
         WHERE id=$12 RETURNING *
     """, data.label, data.provider, data.smtp_host, data.smtp_port, data.smtp_user, smtp_password,
          resend_api_key, data.from_email, data.daily_cap, data.warmup_enabled, data.is_active, inbox_id)
+    if data.from_email != existing["from_email"]:
+        await _run_and_store_deliverability_check(inbox_id, data.from_email)
+        row = await pool.fetchrow("SELECT * FROM inboxes WHERE id=$1", inbox_id)
     return _inbox_public(rec(row))
 
 @api_router.delete("/inboxes/{inbox_id}")
@@ -2369,6 +2505,15 @@ async def delete_inbox(inbox_id: str, user: dict = Depends(get_current_user)):
     if res == "DELETE 0":
         raise HTTPException(status_code=404, detail="Inbox not found")
     return {"deleted": True}
+
+@api_router.post("/inboxes/{inbox_id}/check-deliverability")
+async def recheck_inbox_deliverability(inbox_id: str, user: dict = Depends(get_current_user)):
+    inbox = rec(await pool.fetchrow(
+        "SELECT * FROM inboxes WHERE id=$1 AND user_id=$2", inbox_id, tenant_id(user)))
+    if not inbox:
+        raise HTTPException(status_code=404, detail="Inbox not found")
+    await _run_and_store_deliverability_check(inbox_id, inbox["from_email"])
+    return _inbox_public(rec(await pool.fetchrow("SELECT * FROM inboxes WHERE id=$1", inbox_id)))
 
 @api_router.post("/inboxes/{inbox_id}/test")
 async def test_inbox(inbox_id: str, user: dict = Depends(get_current_user)):

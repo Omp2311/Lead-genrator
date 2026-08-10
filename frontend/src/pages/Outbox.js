@@ -48,7 +48,12 @@ function EmailRow({ e, index, onChanged }) {
   const [sending, setSending] = useState(false);
   const [saving, setSaving] = useState(false);
   const [checkingSpam, setCheckingSpam] = useState(false);
-  const [spamResult, setSpamResult] = useState(null);
+  // Seed with the score already computed at draft-creation time, if any — the user still sees
+  // it without clicking anything, and the manual "Check" button below lets them re-check after
+  // editing the draft.
+  const [spamResult, setSpamResult] = useState(
+    e.spam_score != null ? { score: e.spam_score, flags: e.spam_flags || [] } : null
+  );
   const [generatingVoice, setGeneratingVoice] = useState(false);
   const [voiceNoteUrl, setVoiceNoteUrl] = useState(e.voice_note_url || null);
 
@@ -228,7 +233,7 @@ function EmailRow({ e, index, onChanged }) {
             className="flex items-center gap-2 text-sm bg-zinc-800 text-white px-4 py-2 rounded-sm hover:bg-zinc-700 transition-colors disabled:opacity-60"
           >
             {checkingSpam ? <Loader2 className="w-4 h-4 animate-spin" /> : <ShieldAlert className="w-4 h-4" />}
-            Check deliverability
+            {spamResult ? "Re-check deliverability" : "Check deliverability"}
           </button>
           <button
             onClick={generateVoiceNote}

@@ -201,3 +201,21 @@ CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash);
 -- (LinkedIn's ToS prohibits automating a personal account; see PRD notes).
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS linkedin_note TEXT;
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS linkedin_message TEXT;
+
+-- Reply attribution: when a reply arrives, leads.replied_at is the analytics-facing timestamp
+-- (used to attribute a reply back to the INITIAL email's variant/lead_source, since a reply can
+-- arrive after a follow-up whose own row has no variant). emails.replied_at is set on the most
+-- recently sent email for that lead, for future per-touch attribution.
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS replied_at TIMESTAMPTZ;
+ALTER TABLE emails ADD COLUMN IF NOT EXISTS replied_at TIMESTAMPTZ;
+
+-- Deliverability: per-inbox SPF/DMARC DNS check results, cached (not re-checked on every list
+-- call) with a manual recheck endpoint.
+ALTER TABLE inboxes ADD COLUMN IF NOT EXISTS spf_ok BOOLEAN;
+ALTER TABLE inboxes ADD COLUMN IF NOT EXISTS dmarc_ok BOOLEAN;
+ALTER TABLE inboxes ADD COLUMN IF NOT EXISTS deliverability_checked_at TIMESTAMPTZ;
+
+-- Spam heuristic score, computed once at draft-creation time (not at send time) so the user sees
+-- it before manually sending, rather than gating/blocking automated sends on a heuristic.
+ALTER TABLE emails ADD COLUMN IF NOT EXISTS spam_score INT;
+ALTER TABLE emails ADD COLUMN IF NOT EXISTS spam_flags TEXT[];
