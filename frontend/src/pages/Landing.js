@@ -30,7 +30,7 @@ const plans = [
 
 const Nav = () => (
   <nav className="fixed top-0 inset-x-0 z-50 backdrop-blur-md bg-[#09090B]/70 border-b border-zinc-800/80">
-    <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
+    <div className="w-full px-6 sm:px-10 lg:px-16 xl:px-24 h-16 flex items-center justify-between">
       <Link to="/" className="flex items-center gap-2" data-testid="landing-logo">
         <Radar className="w-6 h-6 text-cyan-400" strokeWidth={2.2} />
         <span className="font-display font-extrabold text-lg tracking-tight">
@@ -64,7 +64,7 @@ export default function Landing() {
         <img src={HERO} alt="" fetchPriority="high" className="absolute inset-0 w-full h-full object-cover opacity-25" />
         <div className="absolute inset-0 bg-gradient-to-b from-[#09090B] via-[#09090B]/70 to-[#09090B]" />
         <div className="absolute -top-24 left-1/2 -translate-x-1/2 w-[600px] h-[600px] bg-cyan-500/10 blur-[120px] rounded-full" />
-        <div className="relative max-w-5xl mx-auto px-6 text-center op-fade-up">
+        <div className="relative w-full px-6 sm:px-10 lg:px-16 xl:px-24 text-center op-fade-up">
           <span className="inline-flex items-center gap-2 text-xs uppercase tracking-[0.2em] text-cyan-300 border border-cyan-500/30 bg-cyan-500/5 rounded-full px-4 py-1.5 mb-8">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 op-live-dot" /> Autonomous outreach agent
           </span>
@@ -94,7 +94,7 @@ export default function Landing() {
       </header>
 
       {/* Stats */}
-      <section className="max-w-5xl mx-auto px-6 -mt-8 mb-24 grid grid-cols-2 sm:grid-cols-4 gap-4">
+      <section className="w-full px-6 sm:px-10 lg:px-16 xl:px-24 mt-4 mb-24 grid grid-cols-2 sm:grid-cols-4 gap-4">
         {[
           { k: "100+", v: "Emails / day on autopilot" },
           { k: "6", v: "Outreach steps automated" },
@@ -109,7 +109,7 @@ export default function Landing() {
       </section>
 
       {/* Features */}
-      <section id="features" className="max-w-6xl mx-auto px-6 py-8">
+      <section id="features" className="w-full px-6 sm:px-10 lg:px-16 xl:px-24 py-8">
         <div className="mb-14 max-w-2xl">
           <p className="text-xs uppercase tracking-[0.2em] text-cyan-400 mb-3">What it does</p>
           <h2 className="font-display text-4xl sm:text-5xl font-black tracking-tight">
@@ -135,7 +135,7 @@ export default function Landing() {
       </section>
 
       {/* How it works */}
-      <section id="how" className="max-w-6xl mx-auto px-6 py-24">
+      <section id="how" className="w-full px-6 sm:px-10 lg:px-16 xl:px-24 py-24">
         <div className="mb-14 max-w-2xl">
           <p className="text-xs uppercase tracking-[0.2em] text-cyan-400 mb-3">How it works</p>
           <h2 className="font-display text-4xl sm:text-5xl font-black tracking-tight">Live in three steps.</h2>
@@ -152,7 +152,7 @@ export default function Landing() {
       </section>
 
       {/* Pricing */}
-      <section id="pricing" className="max-w-6xl mx-auto px-6 py-8">
+      <section id="pricing" className="w-full px-6 sm:px-10 lg:px-16 xl:px-24 py-8">
         <div className="mb-14 text-center">
           <p className="text-xs uppercase tracking-[0.2em] text-cyan-400 mb-3">Pricing</p>
           <h2 className="font-display text-4xl sm:text-5xl font-black tracking-tight">Start free. Scale when you win.</h2>
@@ -198,7 +198,7 @@ export default function Landing() {
       </section>
 
       {/* CTA */}
-      <section className="max-w-5xl mx-auto px-6 py-24">
+      <section className="w-full px-6 sm:px-10 lg:px-16 xl:px-24 py-24">
         <div className="relative overflow-hidden rounded-lg border border-cyan-500/30 bg-gradient-to-br from-[#0e1416] to-[#18181B] p-12 text-center">
           <div className="absolute -top-20 left-1/2 -translate-x-1/2 w-[400px] h-[400px] bg-cyan-500/10 blur-[100px] rounded-full" />
           <div className="relative">
@@ -217,7 +217,7 @@ export default function Landing() {
 
       {/* Footer */}
       <footer className="border-t border-zinc-800">
-        <div className="max-w-6xl mx-auto px-6 py-10 flex flex-col sm:flex-row items-center justify-between gap-4">
+        <div className="w-full px-6 sm:px-10 lg:px-16 xl:px-24 py-10 flex flex-col sm:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-2">
             <Radar className="w-5 h-5 text-cyan-400" />
             <span className="font-display font-bold">OutreachPilot</span>
