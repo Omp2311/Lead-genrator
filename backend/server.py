@@ -384,6 +384,22 @@ def clean_copy_fields(item: dict, keys) -> dict:
             item[k] = clean_copy(item[k])
     return item
 
+def is_valid_email(email: str) -> bool:
+    """Check if email looks real (basic validation)."""
+    if not email or len(email) < 5:
+        return False
+    # Block obvious fake domains
+    fake_domains = ['example.com', 'test.com', 'fake.com', 'demo.com', 'localhost',
+                   'invalid.com', 'sample.com', 'mail.com', 'email.com', 'temp.com',
+                   'ai-generated', 'generated', 'temp', 'test', 'fake']
+    domain = email.split('@')[-1].lower()
+    if any(fake in domain for fake in fake_domains):
+        return False
+    # Must have @ and .
+    if '@' not in email or not re.match(r'^[a-zA-Z0-9._%-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', email):
+        return False
+    return True
+
 def _enforce_word_limit(body: str, sender: str, limit: int) -> str:
     """Backstop for the word-limit rules given in the prompt — LLMs don't always comply,
     so this guarantees it rather than trusting instruction-following alone."""
@@ -724,6 +740,12 @@ def _plaintext_with_footer(body: str, unsub_url: str = None) -> str:
 
 async def send_email(to_email: str, subject: str, body: str, allow: bool = True,
                      user_id: str = None, email_id: str = None, cfg: dict = None) -> dict:
+    # Validate email before sending
+    if not is_valid_email(to_email):
+        logger.warning(f"Rejecting invalid email: {to_email}")
+        return {"status": "invalid_email", "simulated": False, "provider_id": None,
+                "error": f"Invalid email address: {to_email}"}
+
     if not allow:
         return {"status": "sent", "simulated": True, "provider_id": None, "error": None}
     if await is_suppressed(user_id, to_email):
@@ -2860,6 +2882,51 @@ async def delete_api_key(key_id: str, user: dict = Depends(get_current_user)):
     if res == "DELETE 0":
         raise HTTPException(status_code=404, detail="Not found")
     return {"deleted": True}
+
+
+@api_router.get("/leads/quality-check")
+async def check_lead_quality(user: dict = Depends(get_current_user)):
+    """Check which leads have invalid/fake emails."""
+    leads = recs(await pool.fetch(
+        "SELECT id, company, contact_name, email, lead_source FROM leads WHERE user_id=$1 LIMIT 1000",
+        tenant_id(user)))
+
+    invalid = []
+    valid = []
+    for lead in leads:
+        if not is_valid_email(lead.get("email", "")):
+            invalid.append(lead)
+        else:
+            valid.append(lead)
+
+    return {
+        "total": len(leads),
+        "valid": len(valid),
+        "invalid": len(invalid),
+        "invalid_percentage": round((len(invalid) / len(leads) * 100) if leads else 0, 1),
+        "invalid_leads": invalid[:50],  # Show first 50 invalid
+        "invalid_sources": defaultdict(int) if not invalid else {
+            item["lead_source"]: sum(1 for x in invalid if x["lead_source"] == item["lead_source"])
+            for item in invalid
+        }
+    }
+
+
+@api_router.post("/leads/delete-invalid")
+async def delete_invalid_leads(user: dict = Depends(get_current_user)):
+    """Delete all leads with invalid/fake emails."""
+    leads = recs(await pool.fetch(
+        "SELECT id, email FROM leads WHERE user_id=$1",
+        tenant_id(user)))
+
+    deleted_count = 0
+    for lead in leads:
+        if not is_valid_email(lead.get("email", "")):
+            await pool.execute("DELETE FROM leads WHERE id=$1 AND user_id=$2",
+                             lead["id"], tenant_id(user))
+            deleted_count += 1
+
+    return {"deleted": deleted_count, "message": f"Deleted {deleted_count} leads with invalid emails"}
 
 
 # ---------------------------------------------------------------------------
