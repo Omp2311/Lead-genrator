@@ -33,7 +33,7 @@ function Protected({ children }) {
   if (user === null)
     return (
       <div className="min-h-screen flex items-center justify-center bg-[#09090B] text-zinc-500 font-mono text-sm">
-        Initializing OutreachPilot…
+        Initializing OmniReach…
       </div>
     );
   if (!user) return <Navigate to="/login" replace />;

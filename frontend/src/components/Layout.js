@@ -50,7 +50,7 @@ export default function Layout() {
     navigate("/");
   };
 
-  const brandName = brand?.brand_name || "OutreachPilot";
+  const brandName = brand?.brand_name || "OmniReach";
 
   return (
     <div className="min-h-screen flex bg-[#09090B] text-white">
@@ -67,7 +67,7 @@ export default function Layout() {
             </span>
           </div>
           <p className="text-[10px] uppercase tracking-[0.25em] text-zinc-600 mt-2">
-            Autonomous Cold Outreach
+            {brand?.brand_name === "OmniReach" ? "Reach Every Prospect" : "Autonomous Cold Outreach"}
           </p>
         </div>
 

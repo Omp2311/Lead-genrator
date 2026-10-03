@@ -64,11 +64,17 @@ export default function Dashboard() {
     setRunning(true);
     toast.info("Agent deployed — discovering leads & drafting emails…");
     try {
-      const res = await api.post("/automation/run", { count: 8 });
-      toast.success(`${res.data.leads} leads found · ${res.data.emails} emails drafted — review in Outbox`);
+      const settings = await api.get("/settings");
+      const payload = {
+        count: 8,
+        industries: settings.data.industries
+      };
+      const res = await api.post("/automation/run", payload);
+      const mode = res.data.email_live ? "delivered" : "drafted";
+      toast.success(`${res.data.total_leads} leads from ${res.data.industries_run} industries · ${res.data.total_emails} emails ${mode}`);
       await load();
     } catch (e) {
-      toast.error("Run failed. Check your LLM key balance and try again.");
+      toast.error(e?.response?.data?.detail || "Run failed. Check your LLM key balance and try again.");
     } finally {
       setRunning(false);
     }

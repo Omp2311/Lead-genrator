@@ -31,6 +31,7 @@ const SOURCE_LABELS = {
   reddit_hunter: "Reddit + Hunter",
   linkedin_hunter: "LinkedIn + Hunter",
   yc_hunter: "Y Combinator + Hunter",
+  multi_source: "Multi-Source",
   csv: "CSV import",
 };
 function sourceLabel(source) {

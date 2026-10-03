@@ -34,7 +34,7 @@ const Nav = () => (
       <Link to="/" className="flex items-center gap-2" data-testid="landing-logo">
         <Radar className="w-6 h-6 text-cyan-400" strokeWidth={2.2} />
         <span className="font-display font-extrabold text-lg tracking-tight">
-          Outreach<span className="text-cyan-400">Pilot</span>
+          <span className="text-cyan-400">OmniReach</span>
         </span>
       </Link>
       <div className="hidden md:flex items-center gap-8 text-sm text-zinc-400">
@@ -73,9 +73,9 @@ export default function Landing() {
             <span className="text-cyan-400">running itself.</span>
           </h1>
           <p className="text-zinc-400 text-base sm:text-lg max-w-2xl mx-auto mt-6 leading-relaxed">
-            OutreachPilot finds real clients in Dubai & the US, writes hyper-personalized emails,
+            OmniReach finds real clients everywhere, writes hyper-personalized emails,
             fires WhatsApp proposals, follows up, and stops the moment they reply —
-            <span className="text-white"> 100+ a day, zero manual work.</span>
+            <span className="text-white"> reach every prospect perfectly.</span>
           </p>
           <div className="flex flex-wrap items-center justify-center gap-4 mt-10">
             <Link to="/register" data-testid="hero-getstarted-btn" className="flex items-center gap-2 bg-cyan-400 text-[#09090B] font-semibold px-6 py-3.5 rounded-sm hover:bg-cyan-300 transition-colors">
@@ -220,9 +220,9 @@ export default function Landing() {
         <div className="w-full px-6 sm:px-10 lg:px-16 xl:px-24 py-10 flex flex-col sm:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-2">
             <Radar className="w-5 h-5 text-cyan-400" />
-            <span className="font-display font-bold">OutreachPilot</span>
+            <span className="font-display font-bold">OmniReach</span>
           </div>
-          <p className="text-xs text-zinc-400">© {new Date().getFullYear()} OutreachPilot. Autonomous cold outreach.</p>
+          <p className="text-xs text-zinc-400">© {new Date().getFullYear()} OmniReach. Reach every prospect perfectly.</p>
         </div>
       </footer>
     </div>

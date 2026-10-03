@@ -1,0 +1,52 @@
+<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background -->
+  <rect width="200" height="200" fill="#09090B" rx="20"/>
+
+  <!-- Outer circle (Omni - all-encompassing) -->
+  <circle cx="100" cy="100" r="85" fill="none" stroke="#00D9FF" stroke-width="3" opacity="0.3"/>
+
+  <!-- Middle circle -->
+  <circle cx="100" cy="100" r="65" fill="none" stroke="#00D9FF" stroke-width="2" opacity="0.6"/>
+
+  <!-- Inner circle -->
+  <circle cx="100" cy="100" r="45" fill="#00D9FF" opacity="0.1"/>
+
+  <!-- Central core - Om symbol inspired -->
+  <circle cx="100" cy="100" r="28" fill="none" stroke="#00D9FF" stroke-width="2.5"/>
+
+  <!-- Reaching arrows (4 directions) -->
+  <g stroke="#00D9FF" stroke-width="3" stroke-linecap="round">
+    <!-- Top arrow -->
+    <line x1="100" y1="55" x2="100" y2="35"/>
+    <polyline points="95,42 100,35 105,42"/>
+
+    <!-- Right arrow -->
+    <line x1="145" y1="100" x2="165" y2="100"/>
+    <polyline points="158,95 165,100 158,105"/>
+
+    <!-- Bottom arrow -->
+    <line x1="100" y1="145" x2="100" y2="165"/>
+    <polyline points="95,158 100,165 105,158"/>
+
+    <!-- Left arrow -->
+    <line x1="55" y1="100" x2="35" y2="100"/>
+    <polyline points="42,95 35,100 42,105"/>
+  </g>
+
+  <!-- Om text in center -->
+  <text x="100" y="108" font-family="Arial, sans-serif" font-size="32" font-weight="bold" fill="#00D9FF" text-anchor="middle" font-style="italic">Ω</text>
+
+  <!-- Glow effect -->
+  <circle cx="100" cy="100" r="45" fill="none" stroke="#00D9FF" stroke-width="1" opacity="0.5" filter="url(#glow)"/>
+
+  <!-- Gradient definitions -->
+  <defs>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+</svg>

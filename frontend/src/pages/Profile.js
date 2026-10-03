@@ -289,6 +289,64 @@ export default function Profile() {
           </div>
         </div>
 
+<div className="bg-[#18181B] border border-zinc-800 rounded-md p-6 space-y-5">
+          <h3 className="font-display font-semibold text-lg flex items-center gap-2">
+            <Briefcase className="w-4 h-4 text-cyan-400" /> Product URLs by area/industry
+          </h3>
+          <p className="text-sm text-zinc-400">
+            Map any product name, area, or industry to its unique URL. When sending emails, the AI will use the matching URL.
+          </p>
+          <div className="space-y-2">
+            {s.industry_urls && Object.keys(s.industry_urls).filter(name => name.trim()).length > 0 ? (
+              Object.entries(s.industry_urls || {}).filter(([name]) => name.trim()).map(([name, url]) => (
+                <div key={name} className="flex items-end gap-2">
+                  <div className="flex-1">
+                    <label className="text-xs uppercase tracking-wider text-zinc-500">Area/Product name</label>
+                    <input
+                      value={name}
+                      onChange={(e) => {
+                        const newUrls = { ...s.industry_urls };
+                        delete newUrls[name];
+                        newUrls[e.target.value] = url;
+                        set("industry_urls", newUrls);
+                      }}
+                      placeholder="e.g. Restaurant, SaaS, Healthcare"
+                      className="mt-1 w-full bg-[#0f0f11] border border-zinc-800 rounded-sm px-3 py-2 text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none transition-colors"
+                    />
+                  </div>
+                  <div className="flex-1">
+                    <label className="text-xs uppercase tracking-wider text-zinc-500">URL</label>
+                    <input
+                      value={url}
+                      onChange={(e) => set("industry_urls", { ...s.industry_urls, [name]: e.target.value })}
+                      placeholder="https://yourcompany.com/..."
+                      className="mt-1 w-full bg-[#0f0f11] border border-zinc-800 rounded-sm px-3 py-2 text-sm font-mono focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none transition-colors"
+                    />
+                  </div>
+                  <button
+                    onClick={() => {
+                      const newUrls = { ...s.industry_urls };
+                      delete newUrls[name];
+                      set("industry_urls", newUrls);
+                    }}
+                    className="mb-0 px-3 py-2 bg-red-900/30 hover:bg-red-900/50 text-red-300 rounded-sm transition-colors"
+                  >
+                    ×
+                  </button>
+                </div>
+              ))
+            ) : (
+              <p className="text-xs text-zinc-500">No URLs added yet. Click "Add URL" below to create one.</p>
+            )}
+          </div>
+          <button
+            onClick={() => set("industry_urls", { ...s.industry_urls, "": "" })}
+            className="mt-3 px-4 py-2 bg-cyan-400/20 hover:bg-cyan-400/30 text-cyan-300 text-sm rounded-sm transition-colors"
+          >
+            + Add URL
+          </button>
+        </div>
+
         <PasswordSection />
 
         <button

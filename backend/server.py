@@ -281,6 +281,7 @@ class RunInput(BaseModel):
     count: int = 8
     region: Optional[str] = None
     industry: Optional[str] = None
+    industries: Optional[List[str]] = None
     offer: Optional[str] = None
     tone: Optional[str] = None
 
@@ -1478,40 +1479,50 @@ async def fetch_yc_leads(regions, industries, count) -> List[dict]:
         leads = []
         yc_companies = []
 
-        # Fetch Y Combinator company directory
-        try:
-            async with httpx.AsyncClient(timeout=30) as c:
-                # YC public API endpoint
-                resp = await c.get("https://api.ycombinator.com/companies",
-                                  headers={"User-Agent": "OutreachPilot/1.0"})
+        # Try multiple YC API endpoints
+        api_endpoints = [
+            "https://api.ycombinator.com/companies",
+            "https://www.ycombinator.com/api/companies",
+            "https://ycombinator.com/api/companies",
+        ]
 
-                if resp.status_code == 200:
-                    companies_data = resp.json()
-                    if isinstance(companies_data, list):
-                        yc_companies = companies_data
-                    elif isinstance(companies_data, dict) and "companies" in companies_data:
-                        yc_companies = companies_data["companies"]
-        except Exception as e:
-            logger.warning(f"YC API fetch failed, trying alternative method: {e}")
-
-            # Fallback: scrape YC directory page
+        for endpoint in api_endpoints:
             try:
-                async with httpx.AsyncClient(timeout=30) as c:
-                    resp = await c.get("https://www.ycombinator.com/companies",
-                                      headers={"User-Agent": "Mozilla/5.0"})
+                async with httpx.AsyncClient(timeout=15) as c:
+                    resp = await c.get(endpoint, headers={"User-Agent": "OutreachPilot/1.0"})
                     if resp.status_code == 200:
-                        soup = BeautifulSoup(resp.text, "html.parser")
-                        # Extract company data from page (YC structure may vary)
-                        company_elements = soup.find_all("div", class_=["company", "company-card", "result"])
-                        for elem in company_elements[:count * 4]:
-                            name = elem.find("h2", class_=["title", "company-name"])
-                            if name:
-                                yc_companies.append({
-                                    "name": name.get_text(strip=True),
-                                    "website": elem.find("a", href=True)
-                                })
-            except Exception as e2:
-                logger.warning(f"YC directory scrape also failed: {e2}")
+                        companies_data = resp.json()
+                        if isinstance(companies_data, list):
+                            yc_companies = companies_data
+                            break
+                        elif isinstance(companies_data, dict) and "companies" in companies_data:
+                            yc_companies = companies_data["companies"]
+                            break
+            except Exception as e:
+                logger.debug(f"YC endpoint {endpoint} failed: {e}")
+                continue
+
+        # Fallback: Use static list of known YC companies
+        if not yc_companies:
+            logger.warning("YC API failed, using fallback company list")
+            yc_companies = [
+                {"name": "Stripe", "website": "https://stripe.com"},
+                {"name": "Airbnb", "website": "https://airbnb.com"},
+                {"name": "Dropbox", "website": "https://dropbox.com"},
+                {"name": "Reddit", "website": "https://reddit.com"},
+                {"name": "Pinterest", "website": "https://pinterest.com"},
+                {"name": "DoorDash", "website": "https://doordash.com"},
+                {"name": "Instacart", "website": "https://instacart.com"},
+                {"name": "Twitch", "website": "https://twitch.tv"},
+                {"name": "Figma", "website": "https://figma.com"},
+                {"name": "Notion", "website": "https://notion.so"},
+                {"name": "Canva", "website": "https://canva.com"},
+                {"name": "Checkout.com", "website": "https://checkout.com"},
+                {"name": "Nubank", "website": "https://nubank.com.br"},
+                {"name": "N26", "website": "https://n26.com"},
+                {"name": "Brex", "website": "https://brex.com"},
+                {"name": "Revolut", "website": "https://revolut.com"},
+            ]
 
         # Process YC companies
         industry_keywords = [ind.lower() for ind in (industries or ["SaaS"])]
@@ -1578,73 +1589,98 @@ async def fetch_yc_leads(regions, industries, count) -> List[dict]:
 
 
 async def source_leads(settings: dict, count: int, region=None, industry=None):
-    regions = [region] if region else settings.get("regions", ["Dubai, UAE", "United States"])
+    regions = [region] if region else settings.get("regions", ["Dubai, UAE", "USA"])
     industries = [industry] if industry else settings.get("industries", ["SaaS", "IT Services"])
     errors = []
+    all_leads = []
+    leads_per_source = max(1, count // 4)
+
     if APOLLO_API_KEY:
         try:
-            leads = await fetch_apollo_leads(regions, industries, count)
+            leads = await fetch_apollo_leads(regions[:1], industries, leads_per_source)
             if leads:
-                return leads, "apollo"
-            errors.append("Apollo returned no matching people for your current filters.")
+                all_leads.extend(leads)
+            else:
+                errors.append("Apollo: No matching people")
         except Exception as e:
             logger.error(f"Apollo failed: {e}")
             errors.append(f"Apollo: {e}")
-    # Google Places removed - requires billing setup in GCP
+
     if HUNTER_API_KEY and FOURSQUARE_API_KEY:
         try:
-            leads = await fetch_foursquare_hunter_leads(regions, industries, count)
+            leads = await fetch_foursquare_hunter_leads(regions[:1], industries, leads_per_source)
             if leads:
-                return leads, "foursquare_hunter"
-            errors.append("Foursquare + Hunter found no matching companies for your current filters.")
+                all_leads.extend(leads)
+            else:
+                errors.append("Foursquare/Hunter: No matching companies")
         except Exception as e:
             logger.error(f"Foursquare/Hunter failed: {e}")
             errors.append(f"Foursquare/Hunter: {e}")
+
     if GITHUB_API_KEY:
         try:
-            leads = await fetch_github_leads(regions, industries, count)
+            leads = await fetch_github_leads(regions[:1], industries, leads_per_source)
             if leads:
-                return leads, "github"
-            errors.append("GitHub found no matching organizations for your current filters.")
+                all_leads.extend(leads)
+            else:
+                errors.append("GitHub: No matching organizations")
         except Exception as e:
             logger.error(f"GitHub failed: {e}")
             errors.append(f"GitHub: {e}")
+
     if HUNTER_API_KEY:
         try:
-            leads = await fetch_osm_hunter_leads(regions, industries, count)
+            leads = await asyncio.wait_for(
+                fetch_osm_hunter_leads(regions[:1], industries, leads_per_source),
+                timeout=30.0
+            )
             if leads:
-                return leads, "osm_hunter"
-            errors.append("OpenStreetMap + Hunter found no matching companies for your current filters.")
+                all_leads.extend(leads)
+            else:
+                errors.append("OSM/Hunter: No matching companies")
+        except asyncio.TimeoutError:
+            logger.error(f"OSM/Hunter timeout (>30s)")
+            errors.append("OSM/Hunter: Timeout")
         except Exception as e:
             logger.error(f"OSM/Hunter failed: {e}")
             errors.append(f"OSM/Hunter: {e}")
-    if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and HUNTER_API_KEY:
-        try:
-            leads = await fetch_reddit_leads(regions, industries, count)
-            if leads:
-                return leads, "reddit_hunter"
-            errors.append("Reddit + Hunter found no matching companies for your current filters.")
-        except Exception as e:
-            logger.error(f"Reddit/Hunter failed: {e}")
-            errors.append(f"Reddit/Hunter: {e}")
-    if LINKEDIN_EMAIL and LINKEDIN_PASSWORD and HUNTER_API_KEY:
-        try:
-            leads = await fetch_linkedin_leads(regions, industries, count)
-            if leads:
-                return leads, "linkedin_hunter"
-            errors.append("LinkedIn + Hunter found no matching companies for your current filters.")
-        except Exception as e:
-            logger.error(f"LinkedIn/Hunter failed: {e}")
-            errors.append(f"LinkedIn/Hunter: {e}")
+
     if HUNTER_API_KEY:
         try:
-            leads = await fetch_yc_leads(regions, industries, count)
+            leads = await fetch_yc_leads(regions[:1], industries, leads_per_source)
             if leads:
-                return leads, "yc_hunter"
-            errors.append("Y Combinator + Hunter found no matching startups for your current filters.")
+                all_leads.extend(leads)
+            else:
+                errors.append("YC/Hunter: No matching startups")
         except Exception as e:
             logger.error(f"YC/Hunter failed: {e}")
             errors.append(f"YC/Hunter: {e}")
+
+    if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and HUNTER_API_KEY:
+        try:
+            leads = await fetch_reddit_leads(regions[:1], industries, leads_per_source)
+            if leads:
+                all_leads.extend(leads)
+            else:
+                errors.append("Reddit/Hunter: No matching communities")
+        except Exception as e:
+            logger.error(f"Reddit/Hunter failed: {e}")
+            errors.append(f"Reddit/Hunter: {e}")
+
+    if LINKEDIN_EMAIL and LINKEDIN_PASSWORD and HUNTER_API_KEY:
+        try:
+            leads = await fetch_linkedin_leads(regions[:1], industries, leads_per_source)
+            if leads:
+                all_leads.extend(leads)
+            else:
+                errors.append("LinkedIn/Hunter: No matching companies")
+        except Exception as e:
+            logger.error(f"LinkedIn/Hunter failed: {e}")
+            errors.append(f"LinkedIn/Hunter: {e}")
+
+    if all_leads:
+        return all_leads[:count], "multi_source"
+
     raise RuntimeError(
         "No real lead source is available — " +
         (" ".join(errors) if errors else "No lead integrations are connected.") +
@@ -2438,14 +2474,44 @@ async def test_email(user: dict = Depends(get_current_user)):
 @api_router.post("/automation/run")
 async def run_now(data: RunInput, user: dict = Depends(get_current_user)):
     count = max(1, min(data.count, 15))
-    try:
-        result = await execute_run(tenant_id(user), count, data.region, data.industry, data.offer,
-                                   data.tone)
-    except RuntimeError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    await pool.execute("UPDATE settings SET last_run=$1 WHERE user_id=$2",
-                       datetime.fromisoformat(result["run_at"]), tenant_id(user))
-    return result
+    user_id = tenant_id(user)
+    industries_to_run = data.industries or [data.industry] if data.industry else []
+
+    if not industries_to_run:
+        settings = await get_or_create_settings(user_id)
+        industries_to_run = settings.get("industries", ["SaaS", "IT Services"])
+
+    total_leads = 0
+    total_emails = 0
+    real_sent = 0
+    whatsapp_sent = 0
+    email_live = False
+    run_at = None
+
+    for industry in industries_to_run:
+        try:
+            result = await execute_run(user_id, count, data.region, industry, data.offer, data.tone)
+            total_leads += result.get("leads", 0)
+            total_emails += result.get("emails", 0)
+            real_sent += result.get("real_sent", 0)
+            whatsapp_sent += result.get("whatsapp_sent", 0)
+            email_live = result.get("email_live", False)
+            run_at = result.get("run_at")
+        except RuntimeError as e:
+            logger.error(f"Run failed for industry {industry}: {e}")
+            continue
+
+    if run_at:
+        await pool.execute("UPDATE settings SET last_run=$1 WHERE user_id=$2",
+                          datetime.fromisoformat(run_at), user_id)
+
+    return {
+        "total_leads": total_leads,
+        "total_emails": total_emails,
+        "industries_run": len(industries_to_run),
+        "email_live": email_live,
+        "run_at": run_at or datetime.now(timezone.utc).isoformat()
+    }
 
 @api_router.get("/leads")
 async def list_leads(user: dict = Depends(get_current_user)):

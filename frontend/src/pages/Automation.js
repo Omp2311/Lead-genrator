@@ -286,16 +286,21 @@ export default function Automation() {
   };
 
   const runNow = async () => {
+    if (!s.industries || s.industries.length === 0) {
+      toast.error("Add at least one target industry");
+      return;
+    }
     setRunning(true);
     toast.info("Deploying agent with these settings…");
     try {
       const r = await api.post("/automation/run", {
         count: 8,
+        industries: s.industries,
         offer: s.offer,
         tone: s.tone,
       });
       const mode = r.data.email_live ? "delivered" : "drafted";
-      toast.success(`${r.data.leads} leads · ${r.data.emails} emails ${mode}`);
+      toast.success(`${r.data.total_leads} leads from ${r.data.industries_run} industries · ${r.data.total_emails} emails ${mode}`);
     } catch (e) {
       toast.error(formatApiErrorDetail(e?.response?.data?.detail) || "Run failed.");
     } finally {

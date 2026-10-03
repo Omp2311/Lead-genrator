@@ -1,8 +1,8 @@
 {
-  "short_name": "OutreachPilot",
-  "name": "OutreachPilot — Your Cold Outreach, Running Itself",
+  "short_name": "OmniReach",
+  "name": "OmniReach — Reach Every Prospect Perfectly",
   "icons": [
-    { "src": "favicon.ico", "sizes": "16x16 32x32 48x48", "type": "image/x-icon" },
+    { "src": "omnireachlogo.svg", "sizes": "any", "type": "image/svg+xml" },
     { "src": "logo192.png", "type": "image/png", "sizes": "192x192" },
     { "src": "logo512.png", "type": "image/png", "sizes": "512x512" }
   ],
