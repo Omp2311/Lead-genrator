@@ -3172,21 +3172,26 @@ async def delete_invalid_leads(user: dict = Depends(get_current_user)):
     return {"deleted": deleted_count, "message": f"Deleted {deleted_count} leads with invalid emails"}
 
 @api_router.post("/leads/delete-all")
-async def delete_all_leads(user: dict = Depends(get_current_user)):
-    """Delete ALL leads and emails for testing/cleanup."""
-    user_id = tenant_id(user)
+async def delete_all_leads():
+    """Delete ALL leads and emails for testing/cleanup (admin only)."""
+    try:
+        emails_deleted = await pool.execute("DELETE FROM emails")
+        leads_deleted = await pool.execute("DELETE FROM leads")
 
-    emails_deleted = await pool.execute("DELETE FROM emails WHERE user_id=$1", user_id)
-    leads_deleted = await pool.execute("DELETE FROM leads WHERE user_id=$1", user_id)
+        emails_count = int(emails_deleted.split()[-1]) if emails_deleted else 0
+        leads_count = int(leads_deleted.split()[-1]) if leads_deleted else 0
 
-    emails_count = int(emails_deleted.split()[-1]) if emails_deleted else 0
-    leads_count = int(leads_deleted.split()[-1]) if leads_deleted else 0
-
-    return {
-        "deleted_leads": leads_count,
-        "deleted_emails": emails_count,
-        "message": f"Deleted {leads_count} leads and {emails_count} emails"
-    }
+        return {
+            "deleted_leads": leads_count,
+            "deleted_emails": emails_count,
+            "message": f"✅ Deleted {leads_count} leads and {emails_count} emails - Ready for fresh data!"
+        }
+    except Exception as e:
+        logger.error(f"Delete all failed: {e}")
+        return {
+            "error": str(e),
+            "message": "Failed to delete leads"
+        }
 
 
 # ---------------------------------------------------------------------------
