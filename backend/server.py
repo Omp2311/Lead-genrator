@@ -1593,99 +1593,59 @@ async def source_leads(settings: dict, count: int, region=None, industry=None):
     industries = [industry] if industry else settings.get("industries", ["SaaS", "IT Services"])
     errors = []
     all_leads = []
-    leads_per_source = max(1, count // 4)
+    needed = count
 
-    if APOLLO_API_KEY:
+    # Define sources in priority order with their fetch functions
+    sources = [
+        ("Apollo", APOLLO_API_KEY, lambda: fetch_apollo_leads(regions[:1], industries, needed)),
+        ("Foursquare+Hunter", HUNTER_API_KEY and FOURSQUARE_API_KEY, lambda: fetch_foursquare_hunter_leads(regions[:1], industries, needed)),
+        ("GitHub", GITHUB_API_KEY, lambda: fetch_github_leads(regions[:1], industries, needed)),
+        ("YC+Hunter", HUNTER_API_KEY, lambda: fetch_yc_leads(regions[:1], industries, needed)),
+        ("OSM+Hunter", HUNTER_API_KEY, lambda: asyncio.wait_for(fetch_osm_hunter_leads(regions[:1], industries, needed), timeout=30.0)),
+        ("Reddit+Hunter", REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and HUNTER_API_KEY, lambda: fetch_reddit_leads(regions[:1], industries, needed)),
+        ("LinkedIn+Hunter", LINKEDIN_EMAIL and LINKEDIN_PASSWORD and HUNTER_API_KEY, lambda: fetch_linkedin_leads(regions[:1], industries, needed)),
+    ]
+
+    # Try each source in order until we have enough leads or exhaust all sources
+    for source_name, is_enabled, fetch_func in sources:
+        if not is_enabled:
+            logger.debug(f"{source_name}: Disabled (missing credentials)")
+            continue
+
         try:
-            leads = await fetch_apollo_leads(regions[:1], industries, leads_per_source)
+            logger.info(f"Trying {source_name}... (need {needed} more leads)")
+            leads = await fetch_func()
+
             if leads:
                 all_leads.extend(leads)
-            else:
-                errors.append("Apollo: No matching people")
-        except Exception as e:
-            logger.error(f"Apollo failed: {e}")
-            errors.append(f"Apollo: {e}")
+                needed = count - len(all_leads)
+                logger.info(f"{source_name}: Got {len(leads)} leads (total: {len(all_leads)}, need {needed} more)")
 
-    if HUNTER_API_KEY and FOURSQUARE_API_KEY:
-        try:
-            leads = await fetch_foursquare_hunter_leads(regions[:1], industries, leads_per_source)
-            if leads:
-                all_leads.extend(leads)
+                if len(all_leads) >= count:
+                    logger.info(f"Reached target: {len(all_leads)} leads from {source_name}")
+                    return all_leads[:count], "multi_source"
             else:
-                errors.append("Foursquare/Hunter: No matching companies")
-        except Exception as e:
-            logger.error(f"Foursquare/Hunter failed: {e}")
-            errors.append(f"Foursquare/Hunter: {e}")
+                logger.debug(f"{source_name}: No leads found")
+                errors.append(f"{source_name}: No results")
 
-    if GITHUB_API_KEY:
-        try:
-            leads = await fetch_github_leads(regions[:1], industries, leads_per_source)
-            if leads:
-                all_leads.extend(leads)
-            else:
-                errors.append("GitHub: No matching organizations")
-        except Exception as e:
-            logger.error(f"GitHub failed: {e}")
-            errors.append(f"GitHub: {e}")
-
-    if HUNTER_API_KEY:
-        try:
-            leads = await asyncio.wait_for(
-                fetch_osm_hunter_leads(regions[:1], industries, leads_per_source),
-                timeout=30.0
-            )
-            if leads:
-                all_leads.extend(leads)
-            else:
-                errors.append("OSM/Hunter: No matching companies")
         except asyncio.TimeoutError:
-            logger.error(f"OSM/Hunter timeout (>30s)")
-            errors.append("OSM/Hunter: Timeout")
+            logger.warning(f"{source_name}: Timeout (>30s), trying next source...")
+            errors.append(f"{source_name}: Timeout")
+            continue
         except Exception as e:
-            logger.error(f"OSM/Hunter failed: {e}")
-            errors.append(f"OSM/Hunter: {e}")
+            logger.warning(f"{source_name}: Failed ({str(e)[:100]}), trying next source...")
+            errors.append(f"{source_name}: {str(e)[:50]}")
+            continue
 
-    if HUNTER_API_KEY:
-        try:
-            leads = await fetch_yc_leads(regions[:1], industries, leads_per_source)
-            if leads:
-                all_leads.extend(leads)
-            else:
-                errors.append("YC/Hunter: No matching startups")
-        except Exception as e:
-            logger.error(f"YC/Hunter failed: {e}")
-            errors.append(f"YC/Hunter: {e}")
-
-    if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and HUNTER_API_KEY:
-        try:
-            leads = await fetch_reddit_leads(regions[:1], industries, leads_per_source)
-            if leads:
-                all_leads.extend(leads)
-            else:
-                errors.append("Reddit/Hunter: No matching communities")
-        except Exception as e:
-            logger.error(f"Reddit/Hunter failed: {e}")
-            errors.append(f"Reddit/Hunter: {e}")
-
-    if LINKEDIN_EMAIL and LINKEDIN_PASSWORD and HUNTER_API_KEY:
-        try:
-            leads = await fetch_linkedin_leads(regions[:1], industries, leads_per_source)
-            if leads:
-                all_leads.extend(leads)
-            else:
-                errors.append("LinkedIn/Hunter: No matching companies")
-        except Exception as e:
-            logger.error(f"LinkedIn/Hunter failed: {e}")
-            errors.append(f"LinkedIn/Hunter: {e}")
-
+    # If we got any leads at all, return them even if less than requested
     if all_leads:
+        logger.info(f"Using {len(all_leads)} leads from {len([e for e in errors if not any(s in e for s in ['Disabled', 'No results'])])} sources")
         return all_leads[:count], "multi_source"
 
     raise RuntimeError(
         "No real lead source is available — " +
-        (" ".join(errors) if errors else "No lead integrations are connected.") +
-        " Connect Apollo, Foursquare + Hunter, GitHub, Reddit + Hunter, LinkedIn + Hunter, Y Combinator, or just Hunter alone "
-        "(free OpenStreetMap + YC sourcing), or import a CSV of real contacts."
+        (" | ".join(errors) if errors else "No lead integrations are connected.") +
+        " Connect Apollo, Foursquare + Hunter, GitHub, Y Combinator, OpenStreetMap + Hunter, Reddit + Hunter, or LinkedIn + Hunter."
     )
 
 
