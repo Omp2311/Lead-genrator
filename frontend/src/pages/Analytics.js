@@ -16,13 +16,20 @@ const FUNNEL_STEPS = [
 
 const SOURCE_LABELS = {
   apollo: "Apollo",
+  Apollo: "Apollo",
   places_hunter: "Places+Hunter",
   foursquare_hunter: "Foursquare+Hunter",
+  "Foursquare+Hunter": "Foursquare+Hunter",
   github: "GitHub",
+  GitHub: "GitHub",
   osm_hunter: "OSM+Hunter",
+  "OSM+Hunter": "OSM+Hunter",
   reddit_hunter: "Reddit+Hunter",
+  "Reddit+Hunter": "Reddit+Hunter",
   linkedin_hunter: "LinkedIn+Hunter",
+  "LinkedIn+Hunter": "LinkedIn+Hunter",
   yc_hunter: "YC+Hunter",
+  "YC+Hunter": "YC+Hunter",
   multi_source: "Multi-Source",
   csv: "CSV import",
 };

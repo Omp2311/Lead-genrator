@@ -1617,9 +1617,11 @@ async def source_leads(settings: dict, count: int, region=None, industry=None):
             leads = await fetch_func()
 
             if leads:
+                for lead in leads:
+                    lead["lead_source"] = source_name
                 all_leads.extend(leads)
                 needed = count - len(all_leads)
-                logger.info(f"{source_name}: Got {len(leads)} leads (total: {len(all_leads)}, need {needed} more)")
+                logger.info(f"{source_name}: Got {len(leads)} B2B leads (total: {len(all_leads)}, need {needed} more)")
 
                 if len(all_leads) >= count:
                     logger.info(f"Reached target: {len(all_leads)} leads from {source_name}")

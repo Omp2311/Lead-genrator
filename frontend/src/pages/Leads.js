@@ -24,13 +24,20 @@ function copyText(text) {
 
 const SOURCE_LABELS = {
   apollo: "Apollo",
+  Apollo: "Apollo",
   places_hunter: "Places + Hunter",
   foursquare_hunter: "Foursquare + Hunter",
+  "Foursquare+Hunter": "Foursquare + Hunter",
   github: "GitHub",
+  GitHub: "GitHub",
   osm_hunter: "OpenStreetMap + Hunter",
+  "OSM+Hunter": "OpenStreetMap + Hunter",
   reddit_hunter: "Reddit + Hunter",
+  "Reddit+Hunter": "Reddit + Hunter",
   linkedin_hunter: "LinkedIn + Hunter",
+  "LinkedIn+Hunter": "LinkedIn + Hunter",
   yc_hunter: "Y Combinator + Hunter",
+  "YC+Hunter": "Y Combinator + Hunter",
   multi_source: "Multi-Source",
   csv: "CSV import",
 };
