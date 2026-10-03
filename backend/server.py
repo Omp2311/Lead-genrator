@@ -81,6 +81,8 @@ GITHUB_API_KEY = os.environ.get("GITHUB_API_KEY", "").strip()
 REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID", "").strip()
 REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "").strip()
 REDDIT_USER_AGENT = os.environ.get("REDDIT_USER_AGENT", "OutreachPilot/1.0").strip()
+LINKEDIN_EMAIL = os.environ.get("LINKEDIN_EMAIL", "").strip()
+LINKEDIN_PASSWORD = os.environ.get("LINKEDIN_PASSWORD", "").strip()
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()
@@ -108,6 +110,7 @@ VOICE_NOTES_DIR = ROOT_DIR / "voice_notes"
 _apollo_ok = None  # None=untested, True=working, False=blocked (e.g. free plan)
 _places_hunter_ok = None  # None=untested, True=working, False=blocked
 _reddit_hunter_ok = None  # None=untested, True=working, False=blocked
+_linkedin_hunter_ok = None  # None=untested, True=working, False=blocked
 
 def _email_configured() -> bool:
     return bool((SMTP_HOST and SMTP_USER and SMTP_PASSWORD) or RESEND_API_KEY)
@@ -143,6 +146,8 @@ async def integrations_status(user_id: str = None) -> dict:
         "osm_hunter_blocked": bool(HUNTER_API_KEY) and _osm_hunter_ok is False,
         "reddit_hunter_live": bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and HUNTER_API_KEY) and _reddit_hunter_ok is not False,
         "reddit_hunter_blocked": bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and HUNTER_API_KEY) and _reddit_hunter_ok is False,
+        "linkedin_hunter_live": bool(LINKEDIN_EMAIL and LINKEDIN_PASSWORD and HUNTER_API_KEY) and _linkedin_hunter_ok is not False,
+        "linkedin_hunter_blocked": bool(LINKEDIN_EMAIL and LINKEDIN_PASSWORD and HUNTER_API_KEY) and _linkedin_hunter_ok is False,
         "whatsapp_live": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM),
         "reply_detection_live": bool(SMTP_USER and SMTP_PASSWORD),
     }
@@ -1373,6 +1378,89 @@ async def fetch_reddit_leads(regions, industries, count) -> List[dict]:
         raise
 
 
+# ---------------------------------------------------------------------------
+# Real lead sourcing via LinkedIn company pages + Hunter.io enrichment.
+# Find companies by industry/location on LinkedIn, extract domain, enrich with Hunter.
+# ---------------------------------------------------------------------------
+async def fetch_linkedin_leads(regions, industries, count) -> List[dict]:
+    global _linkedin_hunter_ok
+    if not LINKEDIN_EMAIL or not LINKEDIN_PASSWORD:
+        raise RuntimeError("LinkedIn credentials not configured")
+
+    try:
+        from linkedin_api import Linkedin
+
+        # Authenticate with LinkedIn
+        linkedin = Linkedin(LINKEDIN_EMAIL, LINKEDIN_PASSWORD)
+
+        leads = []
+        industry_keywords = industries if industries else ["SaaS"]
+        companies_found = {}
+
+        # Search for companies by keywords on LinkedIn
+        search_keywords = []
+        for industry in industry_keywords:
+            search_keywords.append(industry)
+        for region in regions[:2]:  # Limit to 2 regions to avoid rate limiting
+            search_keywords.append(region.split(",")[0])
+
+        try:
+            # Search companies on LinkedIn
+            for keyword in search_keywords[:5]:
+                try:
+                    results = linkedin.search_companies(keyword, limit=10)
+                    if results:
+                        for company in results:
+                            if isinstance(company, dict):
+                                company_name = company.get('name', '')
+                                website = company.get('website', '')
+                                if company_name and website and company_name not in companies_found:
+                                    companies_found[company_name] = website
+                except Exception as e:
+                    logger.warning(f"LinkedIn search failed for '{keyword}': {e}")
+                    continue
+        except Exception as e:
+            logger.error(f"LinkedIn API error: {e}")
+            _linkedin_hunter_ok = False
+            raise
+
+        # Enrich with Hunter API
+        for company_name, website in list(companies_found.items())[:count * 3]:
+            if len(leads) >= count:
+                break
+
+            domain = _domain_from_url(website)
+            if not domain:
+                continue
+
+            try:
+                contact = await fetch_hunter_contact(domain)
+                if contact:
+                    leads.append({
+                        "company": company_name,
+                        "contact_name": contact["contact_name"],
+                        "title": contact["title"],
+                        "email": contact["email"],
+                        "phone": "",
+                        "location": ", ".join(regions[:1]) if regions else "",
+                        "industry": industries[0] if industries else "SaaS",
+                        "website": f"https://{domain}",
+                        "pain_point": f"Found on LinkedIn in {industries[0] if industries else 'SaaS'} industry",
+                    })
+            except Exception as e:
+                logger.warning(f"Hunter lookup failed for {domain}: {e}")
+                continue
+
+        if leads:
+            _linkedin_hunter_ok = True
+        return leads
+
+    except Exception as e:
+        logger.error(f"LinkedIn lead fetch failed: {e}")
+        _linkedin_hunter_ok = False
+        raise
+
+
 async def source_leads(settings: dict, count: int, region=None, industry=None):
     regions = [region] if region else settings.get("regions", ["Dubai, UAE", "United States"])
     industries = [industry] if industry else settings.get("industries", ["SaaS", "IT Services"])
@@ -1431,10 +1519,19 @@ async def source_leads(settings: dict, count: int, region=None, industry=None):
         except Exception as e:
             logger.error(f"Reddit/Hunter failed: {e}")
             errors.append(f"Reddit/Hunter: {e}")
+    if LINKEDIN_EMAIL and LINKEDIN_PASSWORD and HUNTER_API_KEY:
+        try:
+            leads = await fetch_linkedin_leads(regions, industries, count)
+            if leads:
+                return leads, "linkedin_hunter"
+            errors.append("LinkedIn + Hunter found no matching companies for your current filters.")
+        except Exception as e:
+            logger.error(f"LinkedIn/Hunter failed: {e}")
+            errors.append(f"LinkedIn/Hunter: {e}")
     raise RuntimeError(
         "No real lead source is available — " +
         (" ".join(errors) if errors else "No lead integrations are connected.") +
-        " Connect Apollo, Google Places + Hunter, Foursquare + Hunter, GitHub, Reddit + Hunter, or just Hunter alone "
+        " Connect Apollo, Google Places + Hunter, Foursquare + Hunter, GitHub, Reddit + Hunter, LinkedIn + Hunter, or just Hunter alone "
         "(free OpenStreetMap sourcing), or import a CSV of real contacts."
     )
 
