@@ -28,6 +28,7 @@ const SOURCE_LABELS = {
   foursquare_hunter: "Foursquare + Hunter",
   github: "GitHub",
   osm_hunter: "OpenStreetMap + Hunter",
+  reddit_hunter: "Reddit + Hunter",
   csv: "CSV import",
 };
 function sourceLabel(source) {

@@ -36,6 +36,7 @@ from email.message import EmailMessage
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 import stripe
+import praw
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -77,6 +78,9 @@ HUNTER_API_KEY = os.environ.get("HUNTER_API_KEY", "").strip()
 GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
 FOURSQUARE_API_KEY = os.environ.get("FOURSQUARE_API_KEY", "").strip()
 GITHUB_API_KEY = os.environ.get("GITHUB_API_KEY", "").strip()
+REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID", "").strip()
+REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET", "").strip()
+REDDIT_USER_AGENT = os.environ.get("REDDIT_USER_AGENT", "OutreachPilot/1.0").strip()
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
 TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()
@@ -103,6 +107,7 @@ VOICE_NOTES_DIR = ROOT_DIR / "voice_notes"
 
 _apollo_ok = None  # None=untested, True=working, False=blocked (e.g. free plan)
 _places_hunter_ok = None  # None=untested, True=working, False=blocked
+_reddit_hunter_ok = None  # None=untested, True=working, False=blocked
 
 def _email_configured() -> bool:
     return bool((SMTP_HOST and SMTP_USER and SMTP_PASSWORD) or RESEND_API_KEY)
@@ -136,6 +141,8 @@ async def integrations_status(user_id: str = None) -> dict:
         "github_blocked": bool(GITHUB_API_KEY) and _github_ok is False,
         "osm_hunter_live": bool(HUNTER_API_KEY) and _osm_hunter_ok is not False,
         "osm_hunter_blocked": bool(HUNTER_API_KEY) and _osm_hunter_ok is False,
+        "reddit_hunter_live": bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and HUNTER_API_KEY) and _reddit_hunter_ok is not False,
+        "reddit_hunter_blocked": bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and HUNTER_API_KEY) and _reddit_hunter_ok is False,
         "whatsapp_live": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM),
         "reply_detection_live": bool(SMTP_USER and SMTP_PASSWORD),
     }
@@ -1235,6 +1242,115 @@ async def fetch_osm_hunter_leads(regions, industries, count) -> List[dict]:
     _osm_hunter_ok = True
     return leads
 
+
+# ---------------------------------------------------------------------------
+# Real lead sourcing via Reddit (subreddits) + Hunter.io enrichment.
+# Find relevant subreddits, extract company mentions/contributors, enrich with Hunter.
+# ---------------------------------------------------------------------------
+async def fetch_reddit_leads(regions, industries, count) -> List[dict]:
+    global _reddit_hunter_ok
+    if not REDDIT_CLIENT_ID or not REDDIT_CLIENT_SECRET:
+        raise RuntimeError("Reddit credentials not configured")
+
+    try:
+        reddit = praw.Reddit(
+            client_id=REDDIT_CLIENT_ID,
+            client_secret=REDDIT_CLIENT_SECRET,
+            user_agent=REDDIT_USER_AGENT
+        )
+
+        leads = []
+        industry_keywords = industries if industries else ["SaaS"]
+        subreddits_to_search = []
+
+        # Map industries to relevant subreddits
+        industry_sub_map = {
+            "saas": ["SaaS", "startups", "webdev", "Entrepreneur", "EntrepreneurRidiculed"],
+            "it services": ["learnprogramming", "webdev", "devops", "sysadmin", "ITCareerQuestions"],
+            "software": ["software", "webdev", "programming", "csharp", "Python"],
+            "marketing": ["marketing", "digital_marketing", "Entrepreneur", "growth_hacking"],
+            "startup": ["startups", "Entrepreneur", "SaaS", "web_design"],
+            "consulting": ["consulting", "management_consulting", "Entrepreneur", "BusinessIntelligence"],
+            "it": ["ITCareerQuestions", "webdev", "programming", "learnprogramming", "sysadmin"],
+        }
+
+        # Find subreddits based on industries
+        for industry in industry_keywords:
+            industry_lower = industry.lower()
+            for key, subs in industry_sub_map.items():
+                if key in industry_lower:
+                    subreddits_to_search.extend(subs)
+
+        if not subreddits_to_search:
+            subreddits_to_search = ["SaaS", "startups", "Entrepreneur"]
+
+        subreddits_to_search = list(set(subreddits_to_search))[:5]  # Limit to 5 subreddits
+
+        # Extract domains from posts
+        domains_found = set()
+        try:
+            for subreddit_name in subreddits_to_search:
+                try:
+                    subreddit = reddit.subreddit(subreddit_name)
+                    # Get top posts from past week
+                    for post in subreddit.top(time_filter="week", limit=20):
+                        # Look for URLs in post URL
+                        if post.url and not post.url.startswith("https://reddit.com"):
+                            domain = _domain_from_url(post.url)
+                            if domain and domain not in domains_found:
+                                domains_found.add(domain)
+                        # Look for URLs in post text
+                        if post.selftext:
+                            urls = re.findall(r'https?://[^\s\)]+', post.selftext)
+                            for url in urls:
+                                domain = _domain_from_url(url)
+                                if domain and domain not in domains_found and "reddit" not in domain:
+                                    domains_found.add(domain)
+
+                        if len(domains_found) >= count * 3:
+                            break
+                    if len(domains_found) >= count * 3:
+                        break
+                except Exception as e:
+                    logger.warning(f"Reddit subreddit {subreddit_name} access failed: {e}")
+                    continue
+        except Exception as e:
+            logger.error(f"Reddit connection error: {e}")
+            _reddit_hunter_ok = False
+            raise
+
+        # Enrich with Hunter API
+        for domain in list(domains_found)[:count * 3]:
+            if len(leads) >= count:
+                break
+            try:
+                contact = await fetch_hunter_contact(domain)
+                if contact:
+                    leads.append({
+                        "company": contact.get("company", domain),
+                        "contact_name": contact["contact_name"],
+                        "title": contact["title"],
+                        "email": contact["email"],
+                        "phone": "",
+                        "location": "",
+                        "industry": industries[0] if industries else "SaaS",
+                        "website": f"https://{domain}",
+                        "pain_point": f"Active in {', '.join(subreddits_to_search[:2])} communities discussing {industries[0] if industries else 'software'}",
+                    })
+            except Exception as e:
+                logger.warning(f"Hunter lookup failed for {domain}: {e}")
+                continue
+
+        if leads:
+            _reddit_hunter_ok = True
+        return leads
+
+    except Exception as e:
+        logger.error(f"Reddit lead fetch failed: {e}")
+        _reddit_hunter_ok = False
+        raise
+
+
 async def source_leads(settings: dict, count: int, region=None, industry=None):
     regions = [region] if region else settings.get("regions", ["Dubai, UAE", "United States"])
     industries = [industry] if industry else settings.get("industries", ["SaaS", "IT Services"])
@@ -1284,10 +1400,19 @@ async def source_leads(settings: dict, count: int, region=None, industry=None):
         except Exception as e:
             logger.error(f"OSM/Hunter failed: {e}")
             errors.append(f"OSM/Hunter: {e}")
+    if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and HUNTER_API_KEY:
+        try:
+            leads = await fetch_reddit_leads(regions, industries, count)
+            if leads:
+                return leads, "reddit_hunter"
+            errors.append("Reddit + Hunter found no matching companies for your current filters.")
+        except Exception as e:
+            logger.error(f"Reddit/Hunter failed: {e}")
+            errors.append(f"Reddit/Hunter: {e}")
     raise RuntimeError(
         "No real lead source is available — " +
         (" ".join(errors) if errors else "No lead integrations are connected.") +
-        " Connect Apollo, Google Places + Hunter, Foursquare + Hunter, GitHub, or just Hunter alone "
+        " Connect Apollo, Google Places + Hunter, Foursquare + Hunter, GitHub, Reddit + Hunter, or just Hunter alone "
         "(free OpenStreetMap sourcing), or import a CSV of real contacts."
     )
 
