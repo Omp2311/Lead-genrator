@@ -111,6 +111,7 @@ _apollo_ok = None  # None=untested, True=working, False=blocked (e.g. free plan)
 _places_hunter_ok = None  # None=untested, True=working, False=blocked
 _reddit_hunter_ok = None  # None=untested, True=working, False=blocked
 _linkedin_hunter_ok = None  # None=untested, True=working, False=blocked
+_yc_hunter_ok = None  # None=untested, True=working, False=blocked
 
 def _email_configured() -> bool:
     return bool((SMTP_HOST and SMTP_USER and SMTP_PASSWORD) or RESEND_API_KEY)
@@ -148,6 +149,8 @@ async def integrations_status(user_id: str = None) -> dict:
         "reddit_hunter_blocked": bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and HUNTER_API_KEY) and _reddit_hunter_ok is False,
         "linkedin_hunter_live": bool(LINKEDIN_EMAIL and LINKEDIN_PASSWORD and HUNTER_API_KEY) and _linkedin_hunter_ok is not False,
         "linkedin_hunter_blocked": bool(LINKEDIN_EMAIL and LINKEDIN_PASSWORD and HUNTER_API_KEY) and _linkedin_hunter_ok is False,
+        "yc_hunter_live": bool(HUNTER_API_KEY) and _yc_hunter_ok is not False,
+        "yc_hunter_blocked": bool(HUNTER_API_KEY) and _yc_hunter_ok is False,
         "whatsapp_live": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_FROM),
         "reply_detection_live": bool(SMTP_USER and SMTP_PASSWORD),
     }
@@ -1461,6 +1464,119 @@ async def fetch_linkedin_leads(regions, industries, count) -> List[dict]:
         raise
 
 
+# ---------------------------------------------------------------------------
+# Real lead sourcing via Y Combinator directory + Hunter.io enrichment.
+# YC companies are pre-vetted startups with founders + funding — highest quality leads.
+# Scrapes YC company directory (public data), filters by industry, enriches emails via Hunter.
+# ---------------------------------------------------------------------------
+async def fetch_yc_leads(regions, industries, count) -> List[dict]:
+    global _yc_hunter_ok
+
+    try:
+        from bs4 import BeautifulSoup
+
+        leads = []
+        yc_companies = []
+
+        # Fetch Y Combinator company directory
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                # YC public API endpoint
+                resp = await c.get("https://api.ycombinator.com/companies",
+                                  headers={"User-Agent": "OutreachPilot/1.0"})
+
+                if resp.status_code == 200:
+                    companies_data = resp.json()
+                    if isinstance(companies_data, list):
+                        yc_companies = companies_data
+                    elif isinstance(companies_data, dict) and "companies" in companies_data:
+                        yc_companies = companies_data["companies"]
+        except Exception as e:
+            logger.warning(f"YC API fetch failed, trying alternative method: {e}")
+
+            # Fallback: scrape YC directory page
+            try:
+                async with httpx.AsyncClient(timeout=30) as c:
+                    resp = await c.get("https://www.ycombinator.com/companies",
+                                      headers={"User-Agent": "Mozilla/5.0"})
+                    if resp.status_code == 200:
+                        soup = BeautifulSoup(resp.text, "html.parser")
+                        # Extract company data from page (YC structure may vary)
+                        company_elements = soup.find_all("div", class_=["company", "company-card", "result"])
+                        for elem in company_elements[:count * 4]:
+                            name = elem.find("h2", class_=["title", "company-name"])
+                            if name:
+                                yc_companies.append({
+                                    "name": name.get_text(strip=True),
+                                    "website": elem.find("a", href=True)
+                                })
+            except Exception as e2:
+                logger.warning(f"YC directory scrape also failed: {e2}")
+
+        # Process YC companies
+        industry_keywords = [ind.lower() for ind in (industries or ["SaaS"])]
+
+        for company in yc_companies[:count * 4]:
+            if len(leads) >= count:
+                break
+
+            try:
+                company_name = company.get("name") or company.get("title", "")
+                website = company.get("website") or company.get("url", "")
+
+                if not company_name or not website:
+                    continue
+
+                # Filter by industry if specified
+                if industry_keywords and not any(
+                    keyword in company_name.lower() or
+                    keyword in company.get("description", "").lower()
+                    for keyword in industry_keywords
+                ):
+                    continue
+
+                # Extract domain
+                domain = _domain_from_url(website) if website else None
+                if not domain:
+                    continue
+
+                # Enrich with Hunter API to get founder/CEO email
+                try:
+                    contact = await fetch_hunter_contact(domain)
+                    if contact:
+                        leads.append({
+                            "company": company_name,
+                            "contact_name": contact["contact_name"],
+                            "title": contact["title"],
+                            "email": contact["email"],
+                            "phone": "",
+                            "location": ", ".join(regions[:1]) if regions else "San Francisco",
+                            "industry": industries[0] if industries else "SaaS",
+                            "website": f"https://{domain}",
+                            "pain_point": f"Y Combinator {company.get('batch', 'recent')} founder — scaling startup operations",
+                            "estimated_value": "$10,000-$50,000/year",
+                        })
+                except Exception as e:
+                    logger.warning(f"Hunter enrichment failed for {domain}: {e}")
+                    continue
+
+            except Exception as e:
+                logger.warning(f"YC company processing failed: {e}")
+                continue
+
+        if leads:
+            _yc_hunter_ok = True
+        else:
+            logger.warning("No YC leads found after processing")
+
+        return leads
+
+    except Exception as e:
+        logger.error(f"YC lead fetch failed: {e}")
+        _yc_hunter_ok = False
+        raise
+
+
 async def source_leads(settings: dict, count: int, region=None, industry=None):
     regions = [region] if region else settings.get("regions", ["Dubai, UAE", "United States"])
     industries = [industry] if industry else settings.get("industries", ["SaaS", "IT Services"])
@@ -1528,10 +1644,19 @@ async def source_leads(settings: dict, count: int, region=None, industry=None):
         except Exception as e:
             logger.error(f"LinkedIn/Hunter failed: {e}")
             errors.append(f"LinkedIn/Hunter: {e}")
+    if HUNTER_API_KEY:
+        try:
+            leads = await fetch_yc_leads(regions, industries, count)
+            if leads:
+                return leads, "yc_hunter"
+            errors.append("Y Combinator + Hunter found no matching startups for your current filters.")
+        except Exception as e:
+            logger.error(f"YC/Hunter failed: {e}")
+            errors.append(f"YC/Hunter: {e}")
     raise RuntimeError(
         "No real lead source is available — " +
         (" ".join(errors) if errors else "No lead integrations are connected.") +
-        " Connect Apollo, Google Places + Hunter, Foursquare + Hunter, GitHub, Reddit + Hunter, LinkedIn + Hunter, or just Hunter alone "
+        " Connect Apollo, Google Places + Hunter, Foursquare + Hunter, GitHub, Reddit + Hunter, LinkedIn + Hunter, Y Combinator, or just Hunter alone "
         "(free OpenStreetMap sourcing), or import a CSV of real contacts."
     )
 

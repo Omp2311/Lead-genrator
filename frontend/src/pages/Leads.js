@@ -30,6 +30,7 @@ const SOURCE_LABELS = {
   osm_hunter: "OpenStreetMap + Hunter",
   reddit_hunter: "Reddit + Hunter",
   linkedin_hunter: "LinkedIn + Hunter",
+  yc_hunter: "Y Combinator + Hunter",
   csv: "CSV import",
 };
 function sourceLabel(source) {

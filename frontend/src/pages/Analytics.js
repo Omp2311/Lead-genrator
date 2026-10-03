@@ -22,6 +22,7 @@ const SOURCE_LABELS = {
   osm_hunter: "OSM+Hunter",
   reddit_hunter: "Reddit+Hunter",
   linkedin_hunter: "LinkedIn+Hunter",
+  yc_hunter: "YC+Hunter",
   csv: "CSV import",
 };
 
