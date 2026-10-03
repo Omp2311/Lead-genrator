@@ -1590,15 +1590,7 @@ async def source_leads(settings: dict, count: int, region=None, industry=None):
         except Exception as e:
             logger.error(f"Apollo failed: {e}")
             errors.append(f"Apollo: {e}")
-    if HUNTER_API_KEY and GOOGLE_PLACES_API_KEY:
-        try:
-            leads = await fetch_places_hunter_leads(regions, industries, count)
-            if leads:
-                return leads, "places_hunter"
-            errors.append("Google Places + Hunter found no matching companies for your current filters.")
-        except Exception as e:
-            logger.error(f"Places/Hunter failed: {e}")
-            errors.append(f"Places/Hunter: {e}")
+    # Google Places removed - requires billing setup in GCP
     if HUNTER_API_KEY and FOURSQUARE_API_KEY:
         try:
             leads = await fetch_foursquare_hunter_leads(regions, industries, count)
@@ -1656,8 +1648,8 @@ async def source_leads(settings: dict, count: int, region=None, industry=None):
     raise RuntimeError(
         "No real lead source is available — " +
         (" ".join(errors) if errors else "No lead integrations are connected.") +
-        " Connect Apollo, Google Places + Hunter, Foursquare + Hunter, GitHub, Reddit + Hunter, LinkedIn + Hunter, Y Combinator, or just Hunter alone "
-        "(free OpenStreetMap sourcing), or import a CSV of real contacts."
+        " Connect Apollo, Foursquare + Hunter, GitHub, Reddit + Hunter, LinkedIn + Hunter, Y Combinator, or just Hunter alone "
+        "(free OpenStreetMap + YC sourcing), or import a CSV of real contacts."
     )
 
 

@@ -325,7 +325,6 @@ export default function Automation() {
               {[
                 { label: "Email · SMTP", live: integ.email_live, icon: Mail, hint: integ.sender_email || "Add SMTP creds" },
                 { label: "Leads · Apollo", live: integ.leads_live, icon: Radar, hint: integ.leads_live ? "Real leads live" : (integ.leads_blocked ? "Apollo Free plan — upgrade to enable API" : "Add APOLLO_API_KEY") },
-                { label: "Leads · Places+Hunter", live: integ.places_hunter_live, icon: Radar, hint: integ.places_hunter_live ? "Real leads live" : (integ.places_hunter_blocked ? "Check Google Places billing" : "Add GOOGLE_PLACES_API_KEY") },
                 { label: "Leads · Foursquare+Hunter", live: integ.foursquare_hunter_live, icon: Radar, hint: integ.foursquare_hunter_live ? "Real leads live — no billing needed" : (integ.foursquare_hunter_blocked ? "Check Foursquare API key" : "Add FOURSQUARE_API_KEY") },
                 { label: "Leads · GitHub", live: integ.github_live, icon: Radar, hint: integ.github_live ? "Real leads live — tech companies" : (integ.github_blocked ? "Check GitHub token" : "Add GITHUB_API_KEY") },
                 { label: "Leads · Reddit+Hunter", live: integ.reddit_hunter_live, icon: Radar, hint: integ.reddit_hunter_live ? "Real leads live — community sourced" : (integ.reddit_hunter_blocked ? "Check Reddit credentials" : "Add REDDIT_CLIENT_ID") },
