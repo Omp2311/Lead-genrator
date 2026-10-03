@@ -1838,6 +1838,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
         deliver = email_ready and bool(to_email)
         suppressed_lead = await is_suppressed(user_id, to_email) if to_email else False
         wa = whatsapp_link(phone, lead, sender, settings.get("offer", "")) if phone else None
+        actual_lead_source = lead.get("lead_source", lead_source)
         await pool.execute("""
             INSERT INTO leads (id, user_id, company, contact_name, title, email, phone, location,
                                 industry, website, pain_point, project_idea, estimated_value,
@@ -1848,7 +1849,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
              lead.get("title", ""), to_email, phone, lead.get("location", ""),
              lead.get("industry", ""), lead.get("website", ""), lead.get("pain_point", ""),
              lead.get("project_idea", ""), lead.get("estimated_value", ""), wa, now_dt,
-             source, lead_source, suppressed_lead,
+             source, actual_lead_source, suppressed_lead,
              lead.get("linkedin_note", ""), lead.get("linkedin_message", ""))
         created_leads += 1
 
@@ -1865,7 +1866,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'email',1,'initial',$9,false,NULL,$10,$11,$12,NULL,$13,$14,$15)
         """, str(uuid.uuid4()), user_id, lead_id, lead.get("company", ""),
              lead.get("contact_name", ""), to_email, subject, body,
-             "suppressed" if suppressed_lead else "draft", now_dt, deliver, lead_source,
+             "suppressed" if suppressed_lead else "draft", now_dt, deliver, actual_lead_source,
              subject_variant(idx), spam["score"], spam["flags"])
         created_emails += 1
 
@@ -1881,7 +1882,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'email',$9,'follow_up','scheduled',false,NULL,$10,NULL,$11,$12,$13)
                 """, str(uuid.uuid4()), user_id, lead_id, lead.get("company", ""),
                      lead.get("contact_name", ""), to_email, fu.get("subject", "Re: quick follow-up"),
-                     fu.get("body", ""), step_i + 2, now_dt, deliver, lead_source, scheduled_for)
+                     fu.get("body", ""), step_i + 2, now_dt, deliver, actual_lead_source, scheduled_for)
 
         # WhatsApp proposal
         if wa:
@@ -1977,7 +1978,7 @@ async def draft_emails_for_leads(user_id: str) -> dict:
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'email',$9,'follow_up','scheduled',false,NULL,$10,NULL,$11,$12,$13)
                 """, str(uuid.uuid4()), user_id, lead_id, lead.get("company", ""),
                      lead.get("contact_name", ""), to_email, fu.get("subject", "Re: quick follow-up"),
-                     fu.get("body", ""), step_i + 2, now_dt, deliver, lead_source, scheduled_for)
+                     fu.get("body", ""), step_i + 2, now_dt, deliver, actual_lead_source, scheduled_for)
 
         if phone:
             wa = whatsapp_link(phone, lead, sender, settings.get("offer", ""))
