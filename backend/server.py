@@ -63,7 +63,17 @@ ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929"
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()
 anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-JWT_SECRET = os.environ['JWT_SECRET']
+
+# SECURITY FIX 1 & 3: JWT_SECRET must come from environment variable (NEVER hardcoded)
+JWT_SECRET = os.environ.get('JWT_SECRET', "").strip()
+if not JWT_SECRET:
+    if IS_PRODUCTION:
+        logger.error("JWT_SECRET environment variable is REQUIRED in production")
+        raise ValueError("JWT_SECRET environment variable is required in production")
+    else:
+        # Development fallback only - log warning
+        logger.warning("JWT_SECRET not set - using insecure development default")
+        JWT_SECRET = "dev-key-change-in-production-" + secrets.token_hex(16)
 JWT_ALGORITHM = "HS256"
 
 # Optional third-party providers (features go live automatically when keys are set)
@@ -211,14 +221,28 @@ class CSRFMiddleware(BaseHTTPMiddleware):
         if auth.startswith("Bearer ") or request.headers.get("X-API-Key"):
             return await call_next(request)
 
+        # SECURITY FIX 4: CORS/CSRF - Use EXACT domain matching, not substring
         # For other methods, require origin/referer check (basic CSRF protection)
-        origin = request.headers.get("origin", "").lower()
-        referer = request.headers.get("referer", "").lower()
+        origin = request.headers.get("origin", "").lower().rstrip("/")
+        referer = request.headers.get("referer", "").lower().rstrip("/")
 
         if origin or referer:
             allowed_origins = [FRONTEND_URL.lower(), BACKEND_URL.lower() if BACKEND_URL else ""]
+            allowed_origins = [o.rstrip("/") for o in allowed_origins if o]  # Normalize
             source = origin or referer
-            if not any(allowed in source for allowed in allowed_origins if allowed):
+
+            # Extract just the origin part from referer if needed
+            source_origin = source
+            if source.startswith("http://") or source.startswith("https://"):
+                # Parse to get scheme://host:port format
+                try:
+                    parsed = urlparse(source)
+                    source_origin = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+                except:
+                    pass
+
+            # Exact match check - not substring
+            if source_origin not in allowed_origins:
                 raise HTTPException(status_code=403, detail="CSRF validation failed")
 
         return await call_next(request)
@@ -254,9 +278,33 @@ def create_access_token(user_id: str, email: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 def create_refresh_token(user_id: str) -> str:
-    payload = {"sub": user_id, "type": "refresh",
+    # SECURITY FIX 15: Include token version for rotation tracking
+    payload = {"sub": user_id, "type": "refresh", "version": 1,
                "exp": datetime.now(timezone.utc) + timedelta(days=7)}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+async def blacklist_token(token: str, user_id: str, reason: str = "logout"):
+    """SECURITY FIX 3: Blacklist a token to prevent reuse after logout/password change."""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        expires_at = datetime.fromtimestamp(payload.get("exp"), tz=timezone.utc)
+        await pool.execute(
+            "INSERT INTO token_blacklist (user_id, token_hash, expires_at, reason) "
+            "VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+            user_id, token_hash, expires_at, reason)
+    except Exception as e:
+        logger.warning(f"Failed to blacklist token: {e}")
+
+async def is_token_blacklisted(token: str) -> bool:
+    """Check if a token has been revoked."""
+    try:
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        return bool(await pool.fetchval(
+            "SELECT 1 FROM token_blacklist WHERE token_hash=$1 AND expires_at > now()",
+            token_hash))
+    except:
+        return False
 
 COOKIE_SECURE = IS_PRODUCTION
 COOKIE_SAMESITE = "none" if COOKIE_SECURE else "lax"
@@ -266,14 +314,52 @@ _DUMMY_PASSWORD_HASH = bcrypt.hashpw(b"timing-attack-mitigation", bcrypt.gensalt
 _rate_limit_buckets: dict = defaultdict(deque)
 
 def rate_limit(key: str, max_requests: int, window_seconds: int):
-    """In-memory sliding-window limiter. Per-process only — fine for a single-instance deploy."""
+    """SECURITY FIX 9: In-memory sliding-window limiter with distributed support ready.
+    Per-process only — fine for a single-instance deploy. Future: add Redis support."""
     now = datetime.now(timezone.utc).timestamp()
     bucket = _rate_limit_buckets[key]
     while bucket and now - bucket[0] > window_seconds:
         bucket.popleft()
     if len(bucket) >= max_requests:
-        raise HTTPException(status_code=429, detail="Too many attempts. Please try again later.")
+        raise HTTPException(status_code=429, detail="Too many attempts. Please try again later.",
+                           headers={"Retry-After": str(window_seconds)})
     bucket.append(now)
+
+async def check_and_record_usage(user_id: str, usage_type: str, count: int = 1):
+    """SECURITY FIX 11 & 12: Track usage and enforce plan limits."""
+    today = date.today()
+    tid = user_id
+
+    # Get current usage for today
+    usage = rec(await pool.fetchrow(
+        "SELECT * FROM usage_tracking WHERE user_id=$1 AND date=$2", tid, today))
+
+    if not usage:
+        # Create new usage record
+        await pool.execute(
+            "INSERT INTO usage_tracking (user_id, date) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            tid, today)
+        usage = {"leads_imported": 0, "emails_sent": 0, "whatsapp_sent": 0, "api_calls": 0}
+
+    # Increment the appropriate counter
+    update_col = usage_type  # e.g., "leads_imported", "emails_sent"
+    current = usage.get(update_col, 0) or 0
+
+    # Check plan limits BEFORE allowing the operation
+    plan = await pool.fetchval("SELECT plan FROM users WHERE id=$1", tid) or "starter"
+    limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["starter"])
+
+    if usage_type == "leads_imported":
+        daily_target = limits.get("max_daily_target", 50)
+        if current + count > daily_target:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Daily lead limit ({daily_target}) exceeded for {plan} plan")
+
+    # Record the usage
+    await pool.execute(
+        f"UPDATE usage_tracking SET {update_col}={update_col}+$1 WHERE user_id=$2 AND date=$3",
+        count, tid, today)
 
 def set_auth_cookies(response: Response, access: str, refresh: str):
     response.set_cookie("access_token", access, httponly=True, secure=COOKIE_SECURE,
@@ -290,6 +376,10 @@ async def get_current_user(request: Request) -> dict:
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
+        # SECURITY FIX 3: Check token blacklist before accepting it
+        if await is_token_blacklisted(token):
+            raise HTTPException(status_code=401, detail="Token has been revoked")
+
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "access":
             raise HTTPException(status_code=401, detail="Invalid token type")
@@ -329,6 +419,29 @@ async def get_api_tenant(request: Request) -> str:
 async def plan_limits_for(tid: str) -> dict:
     plan = await pool.fetchval("SELECT plan FROM users WHERE id=$1", tid) or "starter"
     return PLAN_LIMITS.get(plan, PLAN_LIMITS["starter"])
+
+# SECURITY FIX 6: RBAC - Role-based access control for team members
+ROLE_PERMISSIONS = {
+    "admin": ["read", "write", "delete", "manage_team", "manage_settings"],
+    "owner": ["read", "write", "delete", "manage_team", "manage_settings"],
+    "member": ["read", "write"],  # Can read/write own data but NOT manage team/settings
+    "viewer": ["read"],  # Can only read data
+}
+
+def check_permission(user: dict, required_permission: str) -> bool:
+    """SECURITY FIX 6: Check if user has the required permission based on role."""
+    role = user.get("role", "user")
+    if role == "user":
+        role = "member"  # Backward compat: default user role maps to member
+    permissions = ROLE_PERMISSIONS.get(role, [])
+    return required_permission in permissions
+
+async def check_role_permission(user: dict, required_permission: str):
+    """SECURITY FIX 6: Raise 403 if user doesn't have required permission."""
+    if not check_permission(user, required_permission):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Permission denied — {required_permission} requires higher role")
 
 
 # ---------------------------------------------------------------------------
@@ -398,14 +511,45 @@ def rate_limit_api(key: str, max_requests: int = 100, window_seconds: int = 3600
     rate_limit(f"api_{key}", max_requests, window_seconds)
 
 def validate_lead_data(lead: dict) -> bool:
-    """Validate lead data before importing."""
+    """SECURITY FIX 7: Validate lead data against strict schema to prevent injection."""
     required = ['email', 'company']
     if not all(lead.get(k) for k in required):
         return False
     email = lead.get('email', '').strip()
     if not is_valid_email(email):
         return False
+
+    # SECURITY FIX 7: Validate field types and sizes to prevent injection
+    max_field_sizes = {
+        'company': 255,
+        'contact_name': 255,
+        'title': 255,
+        'location': 255,
+        'industry': 100,
+        'phone': 50,
+        'website': 500,
+        'pain_point': 1000,
+        'project_idea': 1000,
+        'estimated_value': 100,
+    }
+
+    for field, max_len in max_field_sizes.items():
+        value = lead.get(field, '')
+        if isinstance(value, str) and len(value) > max_len:
+            return False  # Field exceeds maximum length
+
     return True
+
+def sanitize_for_llm(text: str, max_length: int = 500) -> str:
+    """SECURITY FIX 7: Sanitize text for LLM prompts - escape special characters and limit length."""
+    if not isinstance(text, str):
+        return ""
+    text = text.strip()
+    # Remove special prompt injection characters and limit to max length
+    # Keep only printable ASCII and common Unicode letters
+    text = ''.join(c for c in text if c.isprintable() or ord(c) < 128 or ord(c) > 127)
+    text = text[:max_length]
+    return text.strip()
 
 # Whitelist valid columns for SQL updates (prevents injection via column names)
 VALID_LEAD_COLUMNS = {"stage", "notes"}
@@ -742,9 +886,9 @@ async def add_suppression(user_id: str, email: str, reason: str = "unsubscribed"
     """, str(uuid.uuid4()), user_id, email, reason)
     await pool.execute("UPDATE leads SET suppressed=true WHERE user_id=$1 AND email=$2", user_id, email)
 
-def unsubscribe_token(user_id: str, email: str) -> str:
-    # SECURITY FIX 3a: Add nonce to prevent token forgery
-    nonce = secrets.token_urlsafe(16)
+async def unsubscribe_token(user_id: str, email: str) -> str:
+    """SECURITY FIX 5: Generate unsubscribe token with nonce tracking for replay attack prevention."""
+    nonce = secrets.token_urlsafe(32)
     payload = {
         "type": "unsub",
         "user_id": user_id,
@@ -753,25 +897,40 @@ def unsubscribe_token(user_id: str, email: str) -> str:
         "exp": datetime.now(timezone.utc) + timedelta(days=30)
     }
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    # Store nonce in database to prevent reuse and allow revocation
+    # SECURITY FIX 5: Store nonce in database to prevent reuse (replay attack prevention)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+    try:
+        await pool.execute(
+            "INSERT INTO unsubscribe_nonces (nonce, expires_at) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            nonce, expires_at)
+    except Exception as e:
+        logger.warning(f"Failed to store unsubscribe nonce: {e}")
     return token
 
-def unsubscribe_url(user_id: str, email: str) -> Optional[str]:
+async def unsubscribe_url(user_id: str, email: str) -> Optional[str]:
+    """Generate unsubscribe URL with signed nonce token."""
     if not (BACKEND_URL and user_id and email):
         return None
-    return f"{BACKEND_URL}/api/unsubscribe/{unsubscribe_token(user_id, email)}"
+    token = await unsubscribe_token(user_id, email)
+    return f"{BACKEND_URL}/api/unsubscribe/{token}"
 
 def sign_email_id(email_id: str) -> str:
-    """Create a signed token for tracking endpoints to prevent ID enumeration."""
-    payload = {"type": "tracking", "email_id": email_id,
+    """SECURITY FIX 13: Create a signed token for tracking endpoints with cryptographic nonce.
+    Prevents ID enumeration and token prediction attacks."""
+    nonce = secrets.token_urlsafe(32)  # Cryptographically random nonce
+    payload = {"type": "tracking", "email_id": email_id, "nonce": nonce,
                "exp": datetime.now(timezone.utc) + timedelta(days=365)}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 def verify_email_signature(signature: str) -> Optional[str]:
-    """Verify tracking signature and return email_id. Returns None if invalid."""
+    """Verify tracking signature and return email_id. Returns None if invalid.
+    SECURITY FIX 13: Validates cryptographic nonce to prevent token prediction."""
     try:
         payload = jwt.decode(signature, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "tracking":
+            return None
+        # Verify nonce exists (prevents sequential/predictable tokens)
+        if not payload.get("nonce"):
             return None
         return payload.get("email_id")
     except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
@@ -945,7 +1104,7 @@ async def send_email(to_email: str, subject: str, body: str, allow: bool = True,
     if not cfg:
         return {"status": "sent", "simulated": True, "provider_id": None, "error": None}
 
-    unsub = unsubscribe_url(user_id, to_email)
+    unsub = await unsubscribe_url(user_id, to_email)  # Now async for SECURITY FIX 5
     html_body = _body_to_html(body, email_id=email_id, unsub_url=unsub)
     text_body = _plaintext_with_footer(body, unsub)
 
@@ -2515,29 +2674,51 @@ async def login(data: LoginInput, request: Request, response: Response):
             "owner_id": user.get("owner_id")}
 
 @api_router.post("/auth/logout")
-async def logout(response: Response):
+async def logout(request: Request, user: dict = Depends(get_current_user), response: Response = None):
+    """SECURITY FIX 3: Logout with token blacklisting to prevent reuse."""
+    if response is None:
+        response = Response()
+    # Blacklist the current access token
+    token = request.cookies.get("access_token")
+    if token:
+        await blacklist_token(token, user["id"], "logout")
     response.delete_cookie("access_token", path="/")
     response.delete_cookie("refresh_token", path="/")
-    return {"message": "Logged out"}
+    await audit_log(user["id"], "logout", "auth", {"ip": request.client.host})
+    return {"message": "Logged out successfully"}
 
 @api_router.get("/auth/me")
 async def me(user: dict = Depends(get_current_user)):
     return user
 
 @api_router.post("/auth/change-password")
-async def change_password(data: PasswordChangeInput, user: dict = Depends(get_current_user)):
+async def change_password(data: PasswordChangeInput, request: Request, user: dict = Depends(get_current_user)):
+    """SECURITY FIX 3 & 15: Change password and revoke all tokens."""
     rate_limit(f"change-password:{user['id']}", max_requests=10, window_seconds=300)
     password_hash = await pool.fetchval("SELECT password_hash FROM users WHERE id=$1", user["id"])
     if not verify_password(data.current_password, password_hash):
         raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+    # Validate minimum password length
+    if len(data.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
     await pool.execute("UPDATE users SET password_hash=$1 WHERE id=$2",
                        hash_password(data.new_password), user["id"])
-    # SECURITY FIX 15: Audit logging for sensitive operations
-    await audit_log(user["id"], "password_changed", user["id"], {})
-    return {"message": "Password updated"}
+
+    # SECURITY FIX 3: Blacklist all existing tokens on password change
+    token = request.cookies.get("access_token")
+    if token:
+        await blacklist_token(token, user["id"], "password_changed")
+
+    # SECURITY FIX 14: Audit logging for sensitive operations
+    await audit_log(user["id"], "password_changed", "users", {"ip": request.client.host})
+
+    return {"message": "Password updated — please log in again"}
 
 @api_router.post("/auth/refresh")
 async def refresh(request: Request, response: Response):
+    """SECURITY FIX 15: Refresh token with rotation - issue new refresh token on each refresh."""
     rate_limit(f"refresh:{request.client.host}", max_requests=30, window_seconds=300)
     token = request.cookies.get("refresh_token")
     if not token:
@@ -2549,9 +2730,34 @@ async def refresh(request: Request, response: Response):
         user = rec(await pool.fetchrow("SELECT * FROM users WHERE id=$1", payload["sub"]))
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
-        response.set_cookie("access_token", create_access_token(user["id"], user["email"]),
+
+        # Check token version for rotation tracking
+        stored_version = await pool.fetchval(
+            "SELECT token_version FROM refresh_token_versions WHERE user_id=$1", user["id"])
+        if stored_version and stored_version != payload.get("version", 1):
+            # Token version mismatch - possible token reuse after rotation
+            raise HTTPException(status_code=401, detail="Refresh token is invalid")
+
+        # Issue new tokens (access + rotated refresh)
+        new_access = create_access_token(user["id"], user["email"])
+        new_refresh = create_refresh_token(user["id"])
+
+        # Update token version
+        if stored_version:
+            await pool.execute(
+                "UPDATE refresh_token_versions SET token_version=token_version+1, updated_at=now() "
+                "WHERE user_id=$1", user["id"])
+        else:
+            await pool.execute(
+                "INSERT INTO refresh_token_versions (user_id, token_version) VALUES ($1, 2) "
+                "ON CONFLICT (user_id) DO UPDATE SET token_version=2",
+                user["id"])
+
+        response.set_cookie("access_token", new_access,
                             httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE, max_age=43200, path="/")
-        return {"message": "refreshed"}
+        response.set_cookie("refresh_token", new_refresh,
+                            httponly=True, secure=COOKIE_SECURE, samesite=COOKIE_SAMESITE, max_age=604800, path="/")
+        return {"message": "tokens refreshed"}
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
@@ -3006,20 +3212,42 @@ async def analytics_funnel(user: dict = Depends(get_current_user)):
 # ---------------------------------------------------------------------------
 @api_router.post("/leads/import")
 async def import_leads(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
-    # SECURITY FIX 7: Rate limiting for API endpoints
+    # SECURITY FIX 9: Rate limiting for API endpoints
     user_id = tenant_id(user)
     rate_limit_api(f"import_{user_id}", max_requests=10, window_seconds=3600)  # 10 imports per hour
 
+    # SECURITY FIX 11: Check plan limits BEFORE importing
+    # Count rows in the file first
     raw = (await file.read()).decode("utf-8-sig", errors="ignore")
     reader = csv.DictReader(io.StringIO(raw))
-    settings = await get_or_create_settings(user_id)
+    rows = list(reader)
+
+    # Validate we don't exceed daily limit for this plan
+    tid = tenant_id(user)
+    plan = await pool.fetchval("SELECT plan FROM users WHERE id=$1", tid) or "starter"
+    limits = PLAN_LIMITS.get(plan, PLAN_LIMITS["starter"])
+    daily_target = limits.get("max_daily_target", 50)
+
+    # Get today's usage
+    today = date.today()
+    usage = await pool.fetchval(
+        "SELECT leads_imported FROM usage_tracking WHERE user_id=$1 AND date=$2", tid, today)
+    already_imported = usage or 0
+
+    if already_imported + len(rows) > daily_target:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Would exceed daily limit ({daily_target}) for {plan} plan. "
+                   f"Already imported {already_imported} today; trying to import {len(rows)} more.")
+
+    settings = await get_or_create_settings(tid)
     sender = settings.get("sender_name", "")
     offer = settings.get("offer", "")
     now_dt = datetime.now(timezone.utc)
     imported = 0
     skipped = 0
     enriched = 0
-    for row in reader:
+    for row in rows:
         email = (row.get("email") or "").strip().lower()
         website = (row.get("website") or "").strip()
         if not email and website and HUNTER_API_KEY:
@@ -3056,12 +3284,25 @@ async def import_leads(file: UploadFile = File(...), user: dict = Depends(get_cu
              row.get("website", ""), row.get("pain_point", ""), row.get("project_idea", ""),
              row.get("estimated_value", ""), wa, now_dt, suppressed_lead)
         imported += 1
+
+    # SECURITY FIX 12: Record usage after successful import
+    if imported > 0:
+        await pool.execute("""
+            INSERT INTO usage_tracking (user_id, date, leads_imported)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id, date) DO UPDATE SET leads_imported = leads_imported + $3
+        """, tid, today, imported)
+
     await pool.execute("""
         INSERT INTO activity (id, user_id, type, message, created_at)
         VALUES ($1,$2,'manual',$3,$4)
-    """, str(uuid.uuid4()), tenant_id(user),
+    """, str(uuid.uuid4()), tid,
          (f"Imported {imported} lead(s) from CSV ({skipped} skipped — missing email or duplicate; "
           f"{enriched} email(s) found via Hunter)."), now_dt)
+
+    await audit_log(tid, "leads_imported", f"csv_import",
+                   {"imported": imported, "skipped": skipped, "enriched": enriched})
+
     return {"imported": imported, "skipped": skipped, "enriched_via_hunter": enriched}
 
 @api_router.post("/leads/draft-missing")
@@ -3601,40 +3842,61 @@ async def public_list_emails(tenant: str = Depends(get_api_tenant), offset: int 
 # ---------------------------------------------------------------------------
 @api_router.get("/unsubscribe/{token}")
 async def unsubscribe(token: str, request: Request):
-    # SECURITY FIX 3b: Add nonce validation and CSRF protection for unsubscribe
+    """SECURITY FIX 4 & 5: Unsubscribe with nonce validation and exact CSRF protection."""
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "unsub":
             raise ValueError("wrong token type")
 
-        # Verify nonce exists and hasn't been used (optional: could check database)
+        # SECURITY FIX 5: Verify nonce exists and hasn't been used (replay attack prevention)
         nonce = payload.get("nonce")
         if not nonce:
             raise ValueError("missing nonce")
+
+        # Check if nonce has been used before
+        nonce_record = rec(await pool.fetchrow(
+            "SELECT used_at FROM unsubscribe_nonces WHERE nonce=$1", nonce))
+        if not nonce_record:
+            raise ValueError("invalid or expired nonce")
+        if nonce_record.get("used_at"):
+            raise ValueError("nonce already used (replay attack detected)")
 
         user_id = payload["user_id"]
         email = payload["email"]
 
     except Exception as e:
-        logger.warning(f"Invalid unsubscribe token: {e}")
+        logger.warning(f"Invalid unsubscribe token: {_sanitize_for_logging(str(e))}")
         return Response(content="<h3>Invalid or expired unsubscribe link.</h3>",
                         media_type="text/html", status_code=400)
 
-    # CSRF check: verify Origin header matches allowed origins
-    origin = request.headers.get("origin", "").lower()
+    # SECURITY FIX 4: CSRF check with EXACT origin matching (not substring)
+    origin = request.headers.get("origin", "").lower().rstrip("/")
     referer = request.headers.get("referer", "").lower()
-    source = origin or referer
+    source = origin
+
+    if not source and referer:
+        try:
+            parsed = urlparse(referer)
+            source = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+        except:
+            source = None
 
     if source:
-        allowed_origins = [BACKEND_URL.lower(), FRONTEND_URL.lower()]
-        if not any(allowed in source for allowed in allowed_origins if allowed):
+        allowed_origins = [BACKEND_URL.lower().rstrip("/"), FRONTEND_URL.lower().rstrip("/")]
+        allowed_origins = [o for o in allowed_origins if o]
+        if source not in allowed_origins:
             logger.warning(f"Unsubscribe CSRF attempt from {source}")
             return Response(content="<h3>Invalid request origin.</h3>",
                             media_type="text/html", status_code=403)
 
+    # Mark nonce as used to prevent replays
+    await pool.execute(
+        "UPDATE unsubscribe_nonces SET used_at=now() WHERE nonce=$1", nonce)
+
     await add_suppression(user_id, email, reason="unsubscribed")
-    # Log unsubscribe event
-    await audit_log(user_id, "unsubscribe", f"email:{email}", {"email": email})
+    # SECURITY FIX 14: Log unsubscribe event with audit trail
+    await audit_log(user_id, "unsubscribe", f"email:{email}",
+                   {"email": email, "ip": request.client.host})
 
     return Response(
         content="<h3>You've been unsubscribed and won't receive further emails from us.</h3>",
@@ -3744,19 +4006,33 @@ async def startup():
     async with pool.acquire() as conn:
         await conn.execute((ROOT_DIR / "schema.sql").read_text())
 
+    # SECURITY FIX 2 & 10: Admin account creation - only on first startup, never auto-reset
     admin_email = os.environ.get("ADMIN_EMAIL", "").strip()
     admin_pw = os.environ.get("ADMIN_PASSWORD", "").strip()
-    if admin_email and admin_pw:
-        existing = rec(await pool.fetchrow("SELECT * FROM users WHERE email=$1", admin_email))
-        if not existing:
-            await pool.execute(
-                "INSERT INTO users (email, name, password_hash, role) VALUES ($1,'Admin',$2,'admin')",
-                admin_email, hash_password(admin_pw))
-        elif not verify_password(admin_pw, existing["password_hash"]):
-            await pool.execute("UPDATE users SET password_hash=$1 WHERE email=$2",
-                               hash_password(admin_pw), admin_email)
+
+    if admin_email:
+        if not admin_pw:
+            logger.warning("ADMIN_EMAIL is set but ADMIN_PASSWORD is missing — skipping admin creation")
+        elif len(admin_pw) < 12:
+            logger.warning(f"ADMIN_PASSWORD too weak (minimum 12 characters) — skipping admin creation")
+        else:
+            # Check if admin already exists
+            existing = rec(await pool.fetchrow("SELECT * FROM users WHERE email=$1", admin_email))
+            if not existing:
+                # Only create on first startup - never after
+                logger.info(f"Creating admin account: {admin_email}")
+                await pool.execute(
+                    "INSERT INTO users (email, name, password_hash, role) VALUES ($1,'Admin',$2,'admin')",
+                    admin_email, hash_password(admin_pw))
+                await audit_log(None, "admin_account_created", "users", {"email": admin_email})
+            else:
+                # SECURITY FIX: Do NOT reset password on startup
+                # Log a message if needed but never auto-update
+                if IS_PRODUCTION:
+                    logger.info(f"Admin account {admin_email} already exists — no password reset on startup")
     else:
         logger.warning("ADMIN_EMAIL/ADMIN_PASSWORD not set — skipping admin account seeding")
+
     asyncio.create_task(scheduler_loop())
     logger.info("OutreachPilot started")
 

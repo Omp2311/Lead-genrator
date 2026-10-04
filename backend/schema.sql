@@ -219,3 +219,65 @@ ALTER TABLE inboxes ADD COLUMN IF NOT EXISTS deliverability_checked_at TIMESTAMP
 -- it before manually sending, rather than gating/blocking automated sends on a heuristic.
 ALTER TABLE emails ADD COLUMN IF NOT EXISTS spam_score INT;
 ALTER TABLE emails ADD COLUMN IF NOT EXISTS spam_flags TEXT[];
+
+-- SECURITY FIX 2: RBAC - Add role column for team member access control
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'user';
+
+-- SECURITY FIX 3: JWT Token Blacklist - Track revoked/logged-out tokens
+CREATE TABLE IF NOT EXISTS token_blacklist (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  reason TEXT NOT NULL DEFAULT 'logout'
+);
+CREATE INDEX IF NOT EXISTS idx_token_blacklist_user_expires ON token_blacklist(user_id, expires_at);
+CREATE INDEX IF NOT EXISTS idx_token_blacklist_hash ON token_blacklist(token_hash);
+
+-- SECURITY FIX 5: Unsubscribe Nonce Validation - Track nonce usage to prevent replay attacks
+CREATE TABLE IF NOT EXISTS unsubscribe_nonces (
+  nonce TEXT PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  used_at TIMESTAMPTZ,
+  expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_unsubscribe_nonces_expires ON unsubscribe_nonces(expires_at);
+
+-- SECURITY FIX 12: Usage/Credits Tracking
+CREATE TABLE IF NOT EXISTS usage_tracking (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  date DATE NOT NULL,
+  leads_imported INT NOT NULL DEFAULT 0,
+  emails_sent INT NOT NULL DEFAULT 0,
+  whatsapp_sent INT NOT NULL DEFAULT 0,
+  api_calls INT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(user_id, date)
+);
+CREATE INDEX IF NOT EXISTS idx_usage_tracking_user_date ON usage_tracking(user_id, date);
+
+-- SECURITY FIX 15: Refresh Token Rotation - Track token versions
+CREATE TABLE IF NOT EXISTS refresh_token_versions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_version INT NOT NULL DEFAULT 1,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_refresh_token_user ON refresh_token_versions(user_id);
+
+-- SECURITY FIX 14: Audit logging for sensitive operations
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+  action TEXT NOT NULL,
+  resource TEXT NOT NULL,
+  details JSONB NOT NULL DEFAULT '{}',
+  ip_address TEXT,
+  user_agent TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_user ON audit_logs(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action, created_at);
