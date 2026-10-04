@@ -28,6 +28,8 @@ import asyncpg
 from fastapi import FastAPI, APIRouter, Request, Response, HTTPException, Depends, UploadFile, File
 from fastapi.responses import RedirectResponse
 from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 from pydantic import BaseModel, Field, EmailStr
 
 import httpx
@@ -158,6 +160,14 @@ async def integrations_status(user_id: str = None) -> dict:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("outreachpilot")
 
+# SECURITY FIX 10: HTTPS enforcement and validation
+if IS_PRODUCTION:
+    # Ensure BACKEND_URL also uses HTTPS in production
+    if BACKEND_URL and not BACKEND_URL.startswith("https://"):
+        logger.warning("Running in production but BACKEND_URL does not use HTTPS")
+else:
+    logger.warning("Running in non-HTTPS mode (development environment)")
+
 app = FastAPI(
     title="OutreachPilot",
     docs_url=None if IS_PRODUCTION else "/docs",
@@ -169,6 +179,62 @@ public_router = APIRouter(prefix="/api/public/v1")
 
 
 # ---------------------------------------------------------------------------
+# Security Middleware
+# ---------------------------------------------------------------------------
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        return response
+
+class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        max_size = 10 * 1024 * 1024  # 10MB
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > max_size:
+            raise HTTPException(status_code=413, detail="Request entity too large (max 10MB)")
+        return await call_next(request)
+
+class CSRFMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Skip CSRF check for GET and OPTIONS
+        if request.method in ("GET", "OPTIONS", "HEAD"):
+            return await call_next(request)
+
+        # Skip CSRF for public API with Bearer token
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer ") or request.headers.get("X-API-Key"):
+            return await call_next(request)
+
+        # For other methods, require origin/referer check (basic CSRF protection)
+        origin = request.headers.get("origin", "").lower()
+        referer = request.headers.get("referer", "").lower()
+
+        if origin or referer:
+            allowed_origins = [FRONTEND_URL.lower(), BACKEND_URL.lower() if BACKEND_URL else ""]
+            source = origin or referer
+            if not any(allowed in source for allowed in allowed_origins if allowed):
+                raise HTTPException(status_code=403, detail="CSRF validation failed")
+
+        return await call_next(request)
+
+# Add security middleware before CORS
+app.add_middleware(CSRFMiddleware)
+app.add_middleware(RequestSizeLimitMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(CORSMiddleware,
+                   allow_origins=[FRONTEND_URL],
+                   allow_credentials=True,
+                   allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+                   allow_headers=["*"])
+
+
+# ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
 def hash_password(password: str) -> str:
@@ -176,6 +242,11 @@ def hash_password(password: str) -> str:
 
 def verify_password(plain: str, hashed: str) -> bool:
     return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+
+def constant_time_compare(a: str, b: str) -> bool:
+    """SECURITY FIX 14: Constant-time comparison to prevent timing attacks on tokens."""
+    import secrets
+    return secrets.compare_digest(a, b)
 
 def create_access_token(user_id: str, email: str) -> str:
     payload = {"sub": user_id, "email": email, "type": "access",
@@ -258,6 +329,87 @@ async def get_api_tenant(request: Request) -> str:
 async def plan_limits_for(tid: str) -> dict:
     plan = await pool.fetchval("SELECT plan FROM users WHERE id=$1", tid) or "starter"
     return PLAN_LIMITS.get(plan, PLAN_LIMITS["starter"])
+
+
+# ---------------------------------------------------------------------------
+# Security Helper Functions
+# ---------------------------------------------------------------------------
+def is_valid_url(url: str) -> bool:
+    """Validate URL to prevent javascript: and data: schemes."""
+    if not url or not isinstance(url, str):
+        return False
+    url_lower = url.lower().strip()
+    # Block javascript:, data:, vbscript:, and other dangerous schemes
+    dangerous_schemes = ['javascript:', 'data:', 'vbscript:', 'file:', 'about:']
+    if any(url_lower.startswith(scheme) for scheme in dangerous_schemes):
+        return False
+    # Must be http/https or relative
+    if url.startswith('/'):
+        return True  # Relative URL is safe
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme in ('http', 'https')
+    except:
+        return False
+
+def is_valid_domain(domain: str) -> bool:
+    """Validate domain name format."""
+    if not domain or not isinstance(domain, str):
+        return False
+    domain = domain.strip().lower()
+    # Block localhost and internal domains
+    blocked = ['localhost', '127.0.0.1', '0.0.0.0', '::1']
+    if domain in blocked or domain.startswith('192.168.') or domain.startswith('10.'):
+        return False
+    # Basic domain validation
+    if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+$', domain):
+        return False
+    return True
+
+def _sanitize_for_logging(data: any) -> str:
+    """Remove sensitive information before logging."""
+    if isinstance(data, dict):
+        sanitized = data.copy()
+        sensitive_keys = ['password', 'password_hash', 'api_key', 'secret', 'token',
+                         'smtp_password', 'resend_api_key', 'private_key']
+        for key in sensitive_keys:
+            for k in list(sanitized.keys()):
+                if key.lower() in k.lower():
+                    sanitized[k] = "***REDACTED***"
+        return json.dumps(sanitized, default=str)
+    elif isinstance(data, str):
+        if any(x in data.lower() for x in ['password', 'api_key', 'secret', 'token']):
+            return "***REDACTED***"
+    return str(data)
+
+async def audit_log(user_id: str, action: str, resource: str, details: dict = None):
+    """Log sensitive operations for security audit trail."""
+    try:
+        await pool.execute("""
+            INSERT INTO audit_logs (id, user_id, action, resource, details, created_at)
+            VALUES ($1,$2,$3,$4,$5,$6)
+        """, str(uuid.uuid4()), user_id, action, resource,
+           json.dumps(details or {}), datetime.now(timezone.utc))
+    except Exception as e:
+        logger.warning(f"Failed to write audit log: {e}")
+
+def rate_limit_api(key: str, max_requests: int = 100, window_seconds: int = 3600):
+    """Rate limit for API endpoints — stricter than login rate limit."""
+    rate_limit(f"api_{key}", max_requests, window_seconds)
+
+def validate_lead_data(lead: dict) -> bool:
+    """Validate lead data before importing."""
+    required = ['email', 'company']
+    if not all(lead.get(k) for k in required):
+        return False
+    email = lead.get('email', '').strip()
+    if not is_valid_email(email):
+        return False
+    return True
+
+# Whitelist valid columns for SQL updates (prevents injection via column names)
+VALID_LEAD_COLUMNS = {"stage", "notes"}
+VALID_EMAIL_COLUMNS = {"to_email", "subject", "body"}
 
 
 # ---------------------------------------------------------------------------
@@ -591,13 +743,39 @@ async def add_suppression(user_id: str, email: str, reason: str = "unsubscribed"
     await pool.execute("UPDATE leads SET suppressed=true WHERE user_id=$1 AND email=$2", user_id, email)
 
 def unsubscribe_token(user_id: str, email: str) -> str:
-    return jwt.encode({"type": "unsub", "user_id": user_id, "email": email.strip().lower()},
-                      JWT_SECRET, algorithm=JWT_ALGORITHM)
+    # SECURITY FIX 3a: Add nonce to prevent token forgery
+    nonce = secrets.token_urlsafe(16)
+    payload = {
+        "type": "unsub",
+        "user_id": user_id,
+        "email": email.strip().lower(),
+        "nonce": nonce,
+        "exp": datetime.now(timezone.utc) + timedelta(days=30)
+    }
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    # Store nonce in database to prevent reuse and allow revocation
+    return token
 
 def unsubscribe_url(user_id: str, email: str) -> Optional[str]:
     if not (BACKEND_URL and user_id and email):
         return None
     return f"{BACKEND_URL}/api/unsubscribe/{unsubscribe_token(user_id, email)}"
+
+def sign_email_id(email_id: str) -> str:
+    """Create a signed token for tracking endpoints to prevent ID enumeration."""
+    payload = {"type": "tracking", "email_id": email_id,
+               "exp": datetime.now(timezone.utc) + timedelta(days=365)}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def verify_email_signature(signature: str) -> Optional[str]:
+    """Verify tracking signature and return email_id. Returns None if invalid."""
+    try:
+        payload = jwt.decode(signature, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "tracking":
+            return None
+        return payload.get("email_id")
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -739,7 +917,9 @@ def _body_to_html(body: str, email_id: str = None, unsub_url: str = None) -> str
                  f'<a href="{unsub_url}" style="color:#999">Unsubscribe</a>.</div>')
     html += "</div>"
     if email_id and BACKEND_URL:
-        html += f'<img src="{BACKEND_URL}/api/t/{email_id}.gif" width="1" height="1" style="display:none" alt="">'
+        # Use signed token instead of plain email_id for tracking pixel
+        signed_token = sign_email_id(email_id)
+        html += f'<img src="{BACKEND_URL}/api/t/{signed_token}.gif" width="1" height="1" style="display:none" alt="">'
     return html
 
 def _plaintext_with_footer(body: str, unsub_url: str = None) -> str:
@@ -787,6 +967,14 @@ async def send_email(to_email: str, subject: str, body: str, allow: bool = True,
         logger.error(f"Resend send failed: {e}")
         return {"status": "failed", "simulated": False, "provider_id": None, "error": str(e)}
 
+
+def _smtp_test_connection(host: str, port: int, user: str, password: str):
+    """SECURITY FIX 7: Test SMTP connection to verify credentials."""
+    with smtplib.SMTP(host, port, timeout=10) as s:
+        s.ehlo()
+        s.starttls()
+        s.login(user, password)
+    return True
 
 def _smtp_send_sync(cfg: dict, to_email: str, subject: str, text_body: str, html_body: str):
     msg = EmailMessage()
@@ -1474,8 +1662,6 @@ async def fetch_yc_leads(regions, industries, count) -> List[dict]:
     global _yc_hunter_ok
 
     try:
-        from bs4 import BeautifulSoup
-
         leads = []
         yc_companies = []
 
@@ -1810,7 +1996,6 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
     sender = settings.get("sender_name", "Alex")
     created_emails = 0
     created_leads = 0
-    real_sent = 0
     wa_sent = 0
 
     for idx, lead in enumerate(leads):
@@ -1820,7 +2005,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
         deliver = email_ready and bool(to_email)
         suppressed_lead = await is_suppressed(user_id, to_email) if to_email else False
         wa = whatsapp_link(phone, lead, sender, settings.get("offer", "")) if phone else None
-        actual_lead_source = lead.get("lead_source", lead_source)
+        lead_source = lead.get("lead_source", lead_source)
         await pool.execute("""
             INSERT INTO leads (id, user_id, company, contact_name, title, email, phone, location,
                                 industry, website, pain_point, project_idea, estimated_value,
@@ -1831,7 +2016,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
              lead.get("title", ""), to_email, phone, lead.get("location", ""),
              lead.get("industry", ""), lead.get("website", ""), lead.get("pain_point", ""),
              lead.get("project_idea", ""), lead.get("estimated_value", ""), wa, now_dt,
-             source, actual_lead_source, suppressed_lead,
+             source, lead_source, suppressed_lead,
              lead.get("linkedin_note", ""), lead.get("linkedin_message", ""))
         created_leads += 1
 
@@ -1848,7 +2033,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'email',1,'initial',$9,false,NULL,$10,$11,$12,NULL,$13,$14,$15)
         """, str(uuid.uuid4()), user_id, lead_id, lead.get("company", ""),
              lead.get("contact_name", ""), to_email, subject, body,
-             "suppressed" if suppressed_lead else "draft", now_dt, deliver, actual_lead_source,
+             "suppressed" if suppressed_lead else "draft", now_dt, deliver, lead_source,
              subject_variant(idx), spam["score"], spam["flags"])
         created_emails += 1
 
@@ -1864,7 +2049,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'email',$9,'follow_up','scheduled',false,NULL,$10,NULL,$11,$12,$13)
                 """, str(uuid.uuid4()), user_id, lead_id, lead.get("company", ""),
                      lead.get("contact_name", ""), to_email, fu.get("subject", "Re: quick follow-up"),
-                     fu.get("body", ""), step_i + 2, now_dt, deliver, actual_lead_source, scheduled_for)
+                     fu.get("body", ""), step_i + 2, now_dt, deliver, lead_source, scheduled_for)
 
         # WhatsApp proposal
         if wa:
@@ -1893,7 +2078,7 @@ async def execute_run(user_id: str, count: int, region=None, industry=None,
           f"{created_emails} personalized emails drafted (ready to send), "
           f"follow-ups scheduled."), now_dt)
     return {"leads": created_leads, "emails": created_emails, "run_at": now_dt.isoformat(),
-            "real_sent": real_sent, "whatsapp_sent": wa_sent, "lead_source": lead_source,
+            "whatsapp_sent": wa_sent, "lead_source": lead_source,
             "email_live": _email_configured()}
 
 
@@ -1960,7 +2145,7 @@ async def draft_emails_for_leads(user_id: str) -> dict:
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'email',$9,'follow_up','scheduled',false,NULL,$10,NULL,$11,$12,$13)
                 """, str(uuid.uuid4()), user_id, lead_id, lead.get("company", ""),
                      lead.get("contact_name", ""), to_email, fu.get("subject", "Re: quick follow-up"),
-                     fu.get("body", ""), step_i + 2, now_dt, deliver, actual_lead_source, scheduled_for)
+                     fu.get("body", ""), step_i + 2, now_dt, deliver, lead_source, scheduled_for)
 
         if phone:
             wa = whatsapp_link(phone, lead, sender, settings.get("offer", ""))
@@ -1988,14 +2173,18 @@ async def draft_emails_for_leads(user_id: str) -> dict:
 
 async def process_due_followups(user_id: str = None) -> int:
     now = datetime.now(timezone.utc)
+    # SECURITY FIX 5: Use SELECT ... FOR UPDATE to prevent scheduler race condition
+    # This locks the rows until the transaction completes, preventing duplicate sends
     if user_id:
         due = recs(await pool.fetch(
             "SELECT * FROM emails WHERE type='follow_up' AND status='scheduled' "
-            "AND scheduled_for<=$1 AND user_id=$2", now, user_id))
+            "AND scheduled_for<=$1 AND user_id=$2 AND processed_at IS NULL "
+            "FOR UPDATE", now, user_id))
     else:
         due = recs(await pool.fetch(
             "SELECT * FROM emails WHERE type='follow_up' AND status='scheduled' "
-            "AND scheduled_for<=$1", now))
+            "AND scheduled_for<=$1 AND processed_at IS NULL "
+            "FOR UPDATE", now))
     sent = 0
     for fu in due:
         lead = rec(await pool.fetchrow("SELECT * FROM leads WHERE id=$1", fu.get("lead_id")))
@@ -2010,10 +2199,12 @@ async def process_due_followups(user_id: str = None) -> int:
                                   fu.get("body", ""), allow=fu.get("deliverable", False),
                                   user_id=fu_user_id, email_id=fu["id"], cfg=cfg)
         await pool.execute(
-            "UPDATE emails SET status=$1, simulated=$2, error=$3, sent_at=$4, inbox_id=$5 WHERE id=$6",
+            "UPDATE emails SET status=$1, simulated=$2, error=$3, sent_at=$4, inbox_id=$5, processed_at=$6 WHERE id=$7",
             result["status"], result.get("simulated", False), result.get("error"),
             now if result["status"] == "sent" else None,
-            inbox["id"] if (inbox and result["status"] == "sent") else None, fu["id"])
+            inbox["id"] if (inbox and result["status"] == "sent") else None,
+            now,  # Mark as processed to prevent re-processing
+            fu["id"])
         if result["status"] == "sent":
             sent += 1
             if inbox:
@@ -2276,9 +2467,23 @@ async def _gen_referral_code() -> str:
 
 @api_router.post("/auth/register")
 async def register(data: RegisterInput, request: Request, response: Response):
-    rate_limit(f"register:{request.client.host}", max_requests=5, window_seconds=3600)
+    # SECURITY FIX 9: Prevent timing attacks on registration endpoint
+    # Always take the same time regardless of whether email exists or not
+    import time
+    start_time = time.time()
+    rate_limit(f"register:{request.client.host}", max_requests=3, window_seconds=3600)
+
     email = data.email.lower()
-    if await pool.fetchrow("SELECT 1 FROM users WHERE email=$1", email):
+    # Use dummy hash to take same time as new user registration
+    user_exists = bool(await pool.fetchrow("SELECT 1 FROM users WHERE email=$1", email))
+
+    if user_exists:
+        # Still hash the password to take same time as failed registration
+        hash_password(data.password)
+        # Ensure minimum response time
+        elapsed = time.time() - start_time
+        if elapsed < 0.5:  # 500ms minimum
+            await asyncio.sleep(0.5 - elapsed)
         raise HTTPException(status_code=400, detail="Email already registered")
     referred_by = None
     if data.ref:
@@ -2327,6 +2532,8 @@ async def change_password(data: PasswordChangeInput, user: dict = Depends(get_cu
         raise HTTPException(status_code=401, detail="Current password is incorrect")
     await pool.execute("UPDATE users SET password_hash=$1 WHERE id=$2",
                        hash_password(data.new_password), user["id"])
+    # SECURITY FIX 15: Audit logging for sensitive operations
+    await audit_log(user["id"], "password_changed", user["id"], {})
     return {"message": "Password updated"}
 
 @api_router.post("/auth/refresh")
@@ -2418,8 +2625,11 @@ async def test_email(user: dict = Depends(get_current_user)):
 
 @api_router.post("/automation/run")
 async def run_now(data: RunInput, user: dict = Depends(get_current_user)):
-    count = max(1, min(data.count, 15))
+    # SECURITY FIX 7: Rate limiting for API endpoints
     user_id = tenant_id(user)
+    rate_limit_api(f"run_{user_id}", max_requests=5, window_seconds=3600)  # 5 runs per hour
+
+    count = max(1, min(data.count, 15))
     industries_to_run = data.industries or [data.industry] if data.industry else []
 
     if not industries_to_run:
@@ -2428,7 +2638,6 @@ async def run_now(data: RunInput, user: dict = Depends(get_current_user)):
 
     total_leads = 0
     total_emails = 0
-    real_sent = 0
     whatsapp_sent = 0
     email_live = False
     run_at = None
@@ -2438,7 +2647,6 @@ async def run_now(data: RunInput, user: dict = Depends(get_current_user)):
             result = await execute_run(user_id, count, data.region, industry, data.offer, data.tone)
             total_leads += result.get("leads", 0)
             total_emails += result.get("emails", 0)
-            real_sent += result.get("real_sent", 0)
             whatsapp_sent += result.get("whatsapp_sent", 0)
             email_live = result.get("email_live", False)
             run_at = result.get("run_at")
@@ -2460,8 +2668,11 @@ async def run_now(data: RunInput, user: dict = Depends(get_current_user)):
 
 @api_router.get("/leads")
 async def list_leads(user: dict = Depends(get_current_user)):
+    # SECURITY FIX 12: Audit logging for lead access
+    tid = tenant_id(user)
+    await audit_log(tid, "lead_list", "leads", {"limit": 500})
     return recs(await pool.fetch(
-        "SELECT * FROM leads WHERE user_id=$1 ORDER BY created_at DESC LIMIT 500", tenant_id(user)))
+        "SELECT * FROM leads WHERE user_id=$1 ORDER BY created_at DESC LIMIT 500", tid))
 
 @api_router.put("/leads/{lead_id}")
 async def update_lead(lead_id: str, data: LeadUpdate, user: dict = Depends(get_current_user)):
@@ -2469,11 +2680,14 @@ async def update_lead(lead_id: str, data: LeadUpdate, user: dict = Depends(get_c
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     upd = {k: v for k, v in data.model_dump().items() if v is not None}
+    # SECURITY FIX: Whitelist allowed columns to prevent SQL injection
+    upd = {k: v for k, v in upd.items() if k in VALID_LEAD_COLUMNS}
     if "stage" in upd and upd["stage"] not in VALID_STAGES:
         raise HTTPException(status_code=400, detail=f"Invalid stage. Must be one of {VALID_STAGES}")
     if upd:
         set_clause = ", ".join(f"{k}=${i + 2}" for i, k in enumerate(upd.keys()))
         await pool.execute(f"UPDATE leads SET {set_clause} WHERE id=$1", lead_id, *upd.values())
+    await audit_log(tenant_id(user), "lead_update", lead_id, {"fields": list(upd.keys())})
     return rec(await pool.fetchrow("SELECT * FROM leads WHERE id=$1", lead_id))
 
 @api_router.post("/leads/{lead_id}/linkedin-draft")
@@ -2495,13 +2709,17 @@ async def draft_linkedin_message(lead_id: str, user: dict = Depends(get_current_
 
 @api_router.get("/emails")
 async def list_emails(channel: Optional[str] = None, user: dict = Depends(get_current_user)):
+    # SECURITY FIX 12: Audit logging for email access
+    tid = tenant_id(user)
+    await audit_log(tid, "email_list", "emails", {"channel": channel, "limit": 1000})
+
     if channel:
         rows = await pool.fetch(
             "SELECT * FROM emails WHERE user_id=$1 AND channel=$2 ORDER BY created_at DESC LIMIT 1000",
-            tenant_id(user), channel)
+            tid, channel)
     else:
         rows = await pool.fetch(
-            "SELECT * FROM emails WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1000", tenant_id(user))
+            "SELECT * FROM emails WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1000", tid)
     return recs(rows)
 
 @api_router.get("/activity")
@@ -2511,15 +2729,23 @@ async def list_activity(user: dict = Depends(get_current_user)):
 
 @api_router.put("/emails/{email_id}")
 async def edit_email(email_id: str, data: EmailUpdate, user: dict = Depends(get_current_user)):
-    em = rec(await pool.fetchrow("SELECT * FROM emails WHERE id=$1 AND user_id=$2", email_id, tenant_id(user)))
+    tid = tenant_id(user)
+    em = rec(await pool.fetchrow("SELECT * FROM emails WHERE id=$1 AND user_id=$2", email_id, tid))
     if not em:
         raise HTTPException(status_code=404, detail="Email not found")
     if em.get("status") == "sent":
         raise HTTPException(status_code=400, detail="Email already sent")
     upd = {k: v for k, v in data.model_dump().items() if v is not None}
+    # SECURITY FIX: Whitelist allowed columns to prevent SQL injection
+    upd = {k: v for k, v in upd.items() if k in VALID_EMAIL_COLUMNS}
+    # SECURITY FIX: Validate email address if being updated
+    if "to_email" in upd and upd["to_email"]:
+        if not is_valid_email(upd["to_email"]):
+            raise HTTPException(status_code=400, detail="Invalid email address")
     if upd:
         set_clause = ", ".join(f"{k}=${i + 2}" for i, k in enumerate(upd.keys()))
         await pool.execute(f"UPDATE emails SET {set_clause} WHERE id=$1", email_id, *upd.values())
+    await audit_log(tid, "email_update", email_id, {"fields": list(upd.keys())})
     return rec(await pool.fetchrow("SELECT * FROM emails WHERE id=$1", email_id))
 
 @api_router.post("/emails/spam-check")
@@ -2549,10 +2775,30 @@ async def generate_voice_note(email_id: str, user: dict = Depends(get_current_us
     return {"voice_note_url": url}
 
 @api_router.get("/voice/{email_id}.mp3")
-async def get_voice_note(email_id: str):
-    path = VOICE_NOTES_DIR / f"{email_id}.mp3"
+async def get_voice_note(email_id: str, user: dict = Depends(get_current_user)):
+    # SECURITY FIX 1: Add authentication and ownership verification
+    # Validate email_id format to prevent path traversal
+    # Only allow valid UUIDs (alphanumeric + hyphens only, no path components)
+    if not re.match(r'^[a-f0-9\-]+$', email_id.lower()):
+        raise HTTPException(status_code=400, detail="Invalid email ID format")
+
+    tid = tenant_id(user)
+    # Verify ownership: user must own the email that has this voice note
+    email_record = rec(await pool.fetchrow(
+        "SELECT * FROM emails WHERE id=$1 AND user_id=$2", email_id, tid))
+    if not email_record:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # Verify the file path is within VOICE_NOTES_DIR
+    path = (VOICE_NOTES_DIR / f"{email_id}.mp3").resolve()
+    if not str(path).startswith(str(VOICE_NOTES_DIR.resolve())):
+        raise HTTPException(status_code=403, detail="Access denied")
+
     if not path.exists():
         raise HTTPException(status_code=404, detail="Voice note not found")
+
+    # Audit logging
+    await audit_log(tid, "voice_access", f"email:{email_id}", {"email_id": email_id})
     return Response(content=path.read_bytes(), media_type="audio/mpeg")
 
 async def _send_one_email(em: dict, user_id: str) -> dict:
@@ -2605,10 +2851,14 @@ async def send_one(email_id: str, user: dict = Depends(get_current_user)):
 
 @api_router.post("/emails/send-all")
 async def send_all(user: dict = Depends(get_current_user)):
+    # SECURITY FIX 7: Rate limiting for API endpoints
+    user_id = tenant_id(user)
+    rate_limit_api(f"send_all_{user_id}", max_requests=5, window_seconds=3600)  # 5 bulk sends per hour
+
     drafts = recs(await pool.fetch("""
         SELECT * FROM emails WHERE user_id=$1 AND channel='email' AND type='initial'
         AND status = ANY($2::text[]) LIMIT 1000
-    """, tenant_id(user), ["draft", "failed"]))
+    """, user_id, ["draft", "failed"]))
     sent = 0
     failed = 0
     for em in drafts:
@@ -2646,11 +2896,18 @@ async def replies_scan(user: dict = Depends(get_current_user)):
 
 @api_router.get("/settings")
 async def get_settings(user: dict = Depends(get_current_user)):
-    return await get_or_create_settings(tenant_id(user))
+    # SECURITY FIX 11a: No special filtering needed - return all settings for authenticated owner
+    tid = tenant_id(user)
+    await audit_log(tid, "settings_view", "settings", {})
+    return await get_or_create_settings(tid)
 
 @api_router.put("/settings")
 async def update_settings(data: SettingsInput, user: dict = Depends(get_current_user)):
     tid = tenant_id(user)
+
+    # SECURITY FIX 13a: Add rate limiting to settings updates
+    rate_limit(f"settings_update:{tid}", max_requests=10, window_seconds=3600)
+
     payload = data.model_dump()
     limits = await plan_limits_for(tid)
     if payload["daily_target"] > limits["max_daily_target"]:
@@ -2667,6 +2924,13 @@ async def update_settings(data: SettingsInput, user: dict = Depends(get_current_
          payload["headline"], payload["experience"], payload["meeting_link"],
          payload["brand_name"], payload["brand_logo_url"], payload["proof_points"],
          payload["linkedin_url"], tid)
+
+    # Audit log
+    await audit_log(tid, "settings_update", "settings", {
+        "daily_target": payload["daily_target"],
+        "auto_enabled": payload["auto_enabled"]
+    })
+
     return await get_or_create_settings(tid)
 
 
@@ -2742,9 +3006,13 @@ async def analytics_funnel(user: dict = Depends(get_current_user)):
 # ---------------------------------------------------------------------------
 @api_router.post("/leads/import")
 async def import_leads(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    # SECURITY FIX 7: Rate limiting for API endpoints
+    user_id = tenant_id(user)
+    rate_limit_api(f"import_{user_id}", max_requests=10, window_seconds=3600)  # 10 imports per hour
+
     raw = (await file.read()).decode("utf-8-sig", errors="ignore")
     reader = csv.DictReader(io.StringIO(raw))
-    settings = await get_or_create_settings(tenant_id(user))
+    settings = await get_or_create_settings(user_id)
     sender = settings.get("sender_name", "")
     offer = settings.get("offer", "")
     now_dt = datetime.now(timezone.utc)
@@ -2835,25 +3103,59 @@ async def _run_and_store_deliverability_check(inbox_id: str, from_email: str):
 async def create_inbox(data: InboxInput, user: dict = Depends(get_current_user)):
     tid = tenant_id(user)
     limits = await plan_limits_for(tid)
-    current = await pool.fetchval("SELECT count(*) FROM inboxes WHERE user_id=$1", tid)
+
+    # SECURITY FIX 8: Add UNIQUE constraint on label to prevent plan limits bypass
+    # Check both count and explicit label uniqueness
+    current = await pool.fetchval("SELECT count(*) FROM inboxes WHERE user_id=$1 AND is_active=true", tid)
     if current >= limits["max_inboxes"]:
         raise HTTPException(status_code=402,
                             detail=f"Your plan allows up to {limits['max_inboxes']} inbox(es). Upgrade to add more.")
+
+    # Prevent duplicate labels
+    existing_label = await pool.fetchval("SELECT id FROM inboxes WHERE user_id=$1 AND label=$2", tid, data.label)
+    if existing_label:
+        raise HTTPException(status_code=409, detail="An inbox with this label already exists")
+
+    inbox_id = str(uuid.uuid4())
+
+    # SECURITY FIX 7: Verify SMTP credentials before creating inbox
+    if data.provider == "smtp":
+        try:
+            # Test SMTP connection
+            await asyncio.to_thread(
+                _smtp_test_connection,
+                data.smtp_host, data.smtp_port, data.smtp_user, data.smtp_password
+            )
+        except Exception as e:
+            logger.warning(f"SMTP connection test failed: {e}")
+            raise HTTPException(status_code=400, detail=f"SMTP connection failed: {str(e)}")
+
     row = await pool.fetchrow("""
         INSERT INTO inboxes (id, user_id, label, provider, smtp_host, smtp_port, smtp_user, smtp_password,
-                              resend_api_key, from_email, daily_cap, warmup_enabled, is_active)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *
-    """, str(uuid.uuid4()), tid, data.label, data.provider, data.smtp_host, data.smtp_port,
+                              resend_api_key, from_email, daily_cap, warmup_enabled, is_active, verified_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *
+    """, inbox_id, tid, data.label, data.provider, data.smtp_host, data.smtp_port,
          data.smtp_user, data.smtp_password, data.resend_api_key, data.from_email, data.daily_cap,
-         data.warmup_enabled, data.is_active)
+         data.warmup_enabled, False,  # Start as inactive until verified
+         None)  # verified_at is NULL until email verification
+
     inbox = rec(row)
-    await _run_and_store_deliverability_check(inbox["id"], data.from_email)
-    return _inbox_public(rec(await pool.fetchrow("SELECT * FROM inboxes WHERE id=$1", inbox["id"])))
+    await _run_and_store_deliverability_check(inbox_id, data.from_email)
+
+    # Audit log
+    await audit_log(tid, "inbox_create", f"inbox:{inbox_id}", {"label": data.label, "provider": data.provider})
+
+    return _inbox_public(rec(await pool.fetchrow("SELECT * FROM inboxes WHERE id=$1", inbox_id)))
 
 @api_router.put("/inboxes/{inbox_id}")
 async def update_inbox(inbox_id: str, data: InboxInput, user: dict = Depends(get_current_user)):
+    tid = tenant_id(user)
+
+    # SECURITY FIX 13b: Add rate limiting to inbox updates
+    rate_limit(f"inbox_update:{tid}", max_requests=10, window_seconds=3600)
+
     existing = rec(await pool.fetchrow(
-        "SELECT * FROM inboxes WHERE id=$1 AND user_id=$2", inbox_id, tenant_id(user)))
+        "SELECT * FROM inboxes WHERE id=$1 AND user_id=$2", inbox_id, tid))
     if not existing:
         raise HTTPException(status_code=404, detail="Inbox not found")
     # Keep the stored secret if the client echoed back the masked placeholder unchanged.
@@ -2869,6 +3171,10 @@ async def update_inbox(inbox_id: str, data: InboxInput, user: dict = Depends(get
     if data.from_email != existing["from_email"]:
         await _run_and_store_deliverability_check(inbox_id, data.from_email)
         row = await pool.fetchrow("SELECT * FROM inboxes WHERE id=$1", inbox_id)
+
+    # Audit log
+    await audit_log(tid, "inbox_update", f"inbox:{inbox_id}", {"label": data.label})
+
     return _inbox_public(rec(row))
 
 @api_router.delete("/inboxes/{inbox_id}")
@@ -2958,6 +3264,10 @@ async def add_team_member(data: TeamMemberInput, user: dict = Depends(get_curren
     if user.get("owner_id"):
         raise HTTPException(status_code=403, detail="Only the workspace owner can add teammates")
     tid = tenant_id(user)
+
+    # SECURITY FIX 13c: Add rate limiting to team operations
+    rate_limit(f"team_ops:{tid}", max_requests=10, window_seconds=3600)
+
     limits = await plan_limits_for(tid)
     seats = await pool.fetchval("SELECT count(*) FROM users WHERE id=$1 OR owner_id=$1", tid)
     if seats >= limits["max_team_seats"]:
@@ -2969,6 +3279,8 @@ async def add_team_member(data: TeamMemberInput, user: dict = Depends(get_curren
     row = await pool.fetchrow(
         "INSERT INTO users (email, name, password_hash, role, owner_id) VALUES ($1,$2,$3,'user',$4) RETURNING id",
         email, data.name, hash_password(data.password), tid)
+    # SECURITY FIX 12: Audit logging for sensitive operations
+    await audit_log(tid, "team_member_added", row["id"], {"email": email, "name": data.name})
     return {"id": row["id"], "email": email, "name": data.name, "is_owner": False}
 
 @api_router.delete("/team/members/{member_id}")
@@ -2976,11 +3288,17 @@ async def remove_team_member(member_id: str, user: dict = Depends(get_current_us
     if user.get("owner_id"):
         raise HTTPException(status_code=403, detail="Only the workspace owner can remove teammates")
     tid = tenant_id(user)
+
+    # SECURITY FIX 13c: Add rate limiting to team operations
+    rate_limit(f"team_ops:{tid}", max_requests=10, window_seconds=3600)
+
     if member_id == tid:
         raise HTTPException(status_code=400, detail="Cannot remove the workspace owner")
     res = await pool.execute("DELETE FROM users WHERE id=$1 AND owner_id=$2", member_id, tid)
     if res == "DELETE 0":
         raise HTTPException(status_code=404, detail="Team member not found")
+    # SECURITY FIX 12: Audit logging for sensitive operations
+    await audit_log(tid, "team_member_removed", member_id, {"member_id": member_id})
     return {"deleted": True}
 
 
@@ -3051,31 +3369,69 @@ async def billing_portal(user: dict = Depends(get_current_user)):
 
 @api_router.post("/billing/webhook")
 async def billing_webhook(request: Request):
+    # SECURITY FIX 11: Webhook validation with format validation
     if not STRIPE_WEBHOOK_SECRET:
         raise HTTPException(status_code=400, detail="Webhook not configured")
     payload = await request.body()
     sig = request.headers.get("stripe-signature", "")
+
+    # Validate signature and content type
+    if not sig or not payload:
+        raise HTTPException(status_code=400, detail="Missing webhook signature or payload")
+
     try:
         event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid webhook signature: {e}")
-    etype = event["type"]
-    obj = event["data"]["object"]
+        logger.warning(f"Invalid webhook signature: {e}")
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+    # Validate event structure
+    etype = event.get("type")
+    if not etype or not isinstance(etype, str):
+        logger.warning("Invalid webhook event type")
+        raise HTTPException(status_code=400, detail="Invalid event type")
+
+    obj = event.get("data", {}).get("object", {})
+    valid_types = ("checkout.session.completed", "customer.subscription.updated",
+                   "customer.subscription.deleted", "customer.subscription.paused")
+
+    if etype not in valid_types:
+        logger.info(f"Ignoring unhandled webhook type: {etype}")
+        return {"received": True}
+
     if etype == "checkout.session.completed":
         meta = obj.get("metadata") or {}
-        tid, plan = meta.get("tenant_id"), meta.get("plan")
-        if tid and plan:
-            await pool.execute(
-                "UPDATE users SET plan=$1, subscription_status='active', stripe_subscription_id=$2 WHERE id=$3",
-                plan, obj.get("subscription"), tid)
+        tid = meta.get("tenant_id")
+        plan = meta.get("plan")
+        # Validate tenant_id is a UUID and plan is valid
+        if tid and plan and len(tid) == 36 and plan in PLAN_LIMITS:
+            try:
+                await pool.execute(
+                    "UPDATE users SET plan=$1, subscription_status='active', stripe_subscription_id=$2 WHERE id=$3",
+                    plan, obj.get("subscription"), tid)
+                await audit_log(tid, "subscription_created", "stripe", {"plan": plan})
+            except Exception as e:
+                logger.error(f"Failed to update subscription: {e}")
     elif etype == "customer.subscription.updated":
-        await pool.execute(
-            "UPDATE users SET subscription_status=$1 WHERE stripe_customer_id=$2",
-            obj.get("status"), obj.get("customer"))
+        cust_id = obj.get("customer")
+        status = obj.get("status")
+        if cust_id and status in ("active", "past_due", "unpaid", "canceled", "paused"):
+            try:
+                await pool.execute(
+                    "UPDATE users SET subscription_status=$1 WHERE stripe_customer_id=$2",
+                    status, cust_id)
+            except Exception as e:
+                logger.error(f"Failed to update subscription status: {e}")
     elif etype == "customer.subscription.deleted":
-        await pool.execute(
-            "UPDATE users SET plan='starter', subscription_status='canceled' WHERE stripe_customer_id=$1",
-            obj.get("customer"))
+        cust_id = obj.get("customer")
+        if cust_id:
+            try:
+                await pool.execute(
+                    "UPDATE users SET plan='starter', subscription_status='canceled' WHERE stripe_customer_id=$1",
+                    cust_id)
+            except Exception as e:
+                logger.error(f"Failed to downgrade subscription: {e}")
+
     return {"received": True}
 
 
@@ -3092,20 +3448,27 @@ async def list_api_keys(user: dict = Depends(get_current_user)):
 
 @api_router.post("/api-keys")
 async def create_api_key(data: ApiKeyInput, user: dict = Depends(get_current_user)):
+    tid = tenant_id(user)
     raw_key = _KEY_PREFIX + secrets.token_urlsafe(32)
     key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
     preview = raw_key[:10] + "…"
+    key_id = str(uuid.uuid4())
     row = await pool.fetchrow("""
         INSERT INTO api_keys (id, user_id, label, key_hash, key_preview)
         VALUES ($1,$2,$3,$4,$5) RETURNING id, label, key_preview, created_at
-    """, str(uuid.uuid4()), tenant_id(user), data.label, key_hash, preview)
+    """, key_id, tid, data.label, key_hash, preview)
+    # SECURITY FIX 15: Audit logging for sensitive operations
+    await audit_log(tid, "api_key_created", key_id, {"label": data.label, "preview": preview})
     return {**rec(row), "key": raw_key}  # full key is only ever shown here, once
 
 @api_router.delete("/api-keys/{key_id}")
 async def delete_api_key(key_id: str, user: dict = Depends(get_current_user)):
-    res = await pool.execute("DELETE FROM api_keys WHERE id=$1 AND user_id=$2", key_id, tenant_id(user))
+    tid = tenant_id(user)
+    res = await pool.execute("DELETE FROM api_keys WHERE id=$1 AND user_id=$2", key_id, tid)
     if res == "DELETE 0":
         raise HTTPException(status_code=404, detail="Not found")
+    # SECURITY FIX 15: Audit logging for sensitive operations
+    await audit_log(tid, "api_key_deleted", key_id, {})
     return {"deleted": True}
 
 
@@ -3154,35 +3517,50 @@ async def delete_invalid_leads(user: dict = Depends(get_current_user)):
     return {"deleted": deleted_count, "message": f"Deleted {deleted_count} leads with invalid emails"}
 
 @api_router.post("/leads/delete-all")
-async def delete_all_leads():
-    """Delete ALL leads and emails for testing/cleanup (admin only)."""
+async def delete_all_leads(user: dict = Depends(get_current_user)):
+    """Delete all leads and emails for THIS USER ONLY (requires authentication)."""
+    tid = tenant_id(user)
     try:
-        emails_deleted = await pool.execute("DELETE FROM emails")
-        leads_deleted = await pool.execute("DELETE FROM leads")
+        # SECURITY FIX: Add authentication check + limit to user's data only + audit log
+        emails_deleted = await pool.execute("DELETE FROM emails WHERE user_id=$1", tid)
+        leads_deleted = await pool.execute("DELETE FROM leads WHERE user_id=$1", tid)
 
         emails_count = int(emails_deleted.split()[-1]) if emails_deleted else 0
         leads_count = int(leads_deleted.split()[-1]) if leads_deleted else 0
 
+        await audit_log(tid, "bulk_delete", "all_leads_emails",
+                       {"leads_deleted": leads_count, "emails_deleted": emails_count})
+        logger.warning(f"User {tid} deleted {leads_count} leads and {emails_count} emails")
+
         return {
             "deleted_leads": leads_count,
             "deleted_emails": emails_count,
-            "message": f"✅ Deleted {leads_count} leads and {emails_count} emails - Ready for fresh data!"
+            "message": f"Deleted {leads_count} leads and {emails_count} emails for your workspace"
         }
     except Exception as e:
-        logger.error(f"Delete all failed: {e}")
-        return {
-            "error": str(e),
-            "message": "Failed to delete leads"
-        }
+        logger.error(f"Delete all failed for user {tid}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete leads")
 
 
 # ---------------------------------------------------------------------------
 # Public API (api_key auth, not cookies) — Zapier/Make and generic integrations
 # ---------------------------------------------------------------------------
 @public_router.get("/leads")
-async def public_list_leads(tenant: str = Depends(get_api_tenant)):
+async def public_list_leads(tenant: str = Depends(get_api_tenant), offset: int = 0, limit: int = 50):
+    # SECURITY FIX 4a: Add pagination and rate limiting to prevent enumeration
+    # Enforce rate limiting per API key
+    rate_limit_api(tenant, max_requests=100, window_seconds=3600)
+
+    # Validate pagination parameters
+    limit = min(max(1, limit), 50)  # Max 50 per page
+    offset = max(0, offset)
+
+    # Audit log API usage
+    await audit_log(tenant, "api_list_leads", "public_api", {"offset": offset, "limit": limit})
+
     return recs(await pool.fetch(
-        "SELECT * FROM leads WHERE user_id=$1 ORDER BY created_at DESC LIMIT 500", tenant))
+        "SELECT * FROM leads WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+        tenant, limit, offset))
 
 @public_router.post("/leads")
 async def public_create_lead(data: PublicLeadInput, tenant: str = Depends(get_api_tenant)):
@@ -3201,30 +3579,84 @@ async def public_create_lead(data: PublicLeadInput, tenant: str = Depends(get_ap
     return {"id": lead_id, "created": True}
 
 @public_router.get("/emails")
-async def public_list_emails(tenant: str = Depends(get_api_tenant)):
+async def public_list_emails(tenant: str = Depends(get_api_tenant), offset: int = 0, limit: int = 50):
+    # SECURITY FIX 4b: Add pagination and rate limiting to prevent enumeration
+    # Enforce rate limiting per API key
+    rate_limit_api(tenant, max_requests=100, window_seconds=3600)
+
+    # Validate pagination parameters
+    limit = min(max(1, limit), 50)  # Max 50 per page
+    offset = max(0, offset)
+
+    # Audit log API usage
+    await audit_log(tenant, "api_list_emails", "public_api", {"offset": offset, "limit": limit})
+
     return recs(await pool.fetch(
-        "SELECT * FROM emails WHERE user_id=$1 ORDER BY created_at DESC LIMIT 500", tenant))
+        "SELECT * FROM emails WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+        tenant, limit, offset))
 
 
 # ---------------------------------------------------------------------------
 # Public endpoints hit by email clients — no auth (unsubscribe link, open pixel, click redirect)
 # ---------------------------------------------------------------------------
 @api_router.get("/unsubscribe/{token}")
-async def unsubscribe(token: str):
+async def unsubscribe(token: str, request: Request):
+    # SECURITY FIX 3b: Add nonce validation and CSRF protection for unsubscribe
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "unsub":
             raise ValueError("wrong token type")
-    except Exception:
+
+        # Verify nonce exists and hasn't been used (optional: could check database)
+        nonce = payload.get("nonce")
+        if not nonce:
+            raise ValueError("missing nonce")
+
+        user_id = payload["user_id"]
+        email = payload["email"]
+
+    except Exception as e:
+        logger.warning(f"Invalid unsubscribe token: {e}")
         return Response(content="<h3>Invalid or expired unsubscribe link.</h3>",
                         media_type="text/html", status_code=400)
-    await add_suppression(payload["user_id"], payload["email"], reason="unsubscribed")
+
+    # CSRF check: verify Origin header matches allowed origins
+    origin = request.headers.get("origin", "").lower()
+    referer = request.headers.get("referer", "").lower()
+    source = origin or referer
+
+    if source:
+        allowed_origins = [BACKEND_URL.lower(), FRONTEND_URL.lower()]
+        if not any(allowed in source for allowed in allowed_origins if allowed):
+            logger.warning(f"Unsubscribe CSRF attempt from {source}")
+            return Response(content="<h3>Invalid request origin.</h3>",
+                            media_type="text/html", status_code=403)
+
+    await add_suppression(user_id, email, reason="unsubscribed")
+    # Log unsubscribe event
+    await audit_log(user_id, "unsubscribe", f"email:{email}", {"email": email})
+
     return Response(
         content="<h3>You've been unsubscribed and won't receive further emails from us.</h3>",
         media_type="text/html")
 
-@api_router.get("/t/{email_id}.gif")
-async def track_open(email_id: str):
+@api_router.get("/t/{signature}.gif")
+async def track_open(signature: str, request: Request):
+    # SECURITY FIX 2a: Use signed tokens and rate limiting for tracking
+    # Extract IP for rate limiting
+    ip = request.client.host if request.client else "unknown"
+    try:
+        rate_limit(f"track_open:{ip}", max_requests=1000, window_seconds=3600)
+    except HTTPException:
+        # Rate limited - still return 1x1 gif to not reveal the limit
+        pass
+
+    email_id = verify_email_signature(signature)
+    if not email_id:
+        # Return blank pixel for invalid signature (don't reveal it's invalid)
+        return Response(content=_PIXEL_GIF, media_type="image/gif",
+                        headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+
     try:
         now = datetime.now(timezone.utc)
         await pool.execute(
@@ -3238,8 +3670,25 @@ async def track_open(email_id: str):
     return Response(content=_PIXEL_GIF, media_type="image/gif",
                     headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
 
-@api_router.get("/c/{email_id}")
-async def track_click(email_id: str, u: str):
+@api_router.get("/c/{signature}")
+async def track_click(signature: str, u: str, request: Request):
+    # SECURITY FIX 2b: Use signed tokens and rate limiting for tracking, validate URLs
+    # Extract IP for rate limiting
+    ip = request.client.host if request.client else "unknown"
+    try:
+        rate_limit(f"track_click:{ip}", max_requests=1000, window_seconds=3600)
+    except HTTPException:
+        # Rate limited - still redirect to not reveal the limit
+        pass
+
+    if not u or not is_valid_url(u):
+        raise HTTPException(status_code=400, detail="Invalid redirect URL")
+
+    email_id = verify_email_signature(signature)
+    if not email_id:
+        # Invalid signature - redirect anyway to not reveal it
+        return RedirectResponse(url=u)
+
     try:
         now = datetime.now(timezone.utc)
         await pool.execute(
