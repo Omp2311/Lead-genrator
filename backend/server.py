@@ -1502,27 +1502,9 @@ async def fetch_yc_leads(regions, industries, count) -> List[dict]:
                 logger.debug(f"YC endpoint {endpoint} failed: {e}")
                 continue
 
-        # Fallback: Use static list of known YC companies
+        # No fallback - if YC API fails, raise error
         if not yc_companies:
-            logger.warning("YC API failed, using fallback company list")
-            yc_companies = [
-                {"name": "Stripe", "website": "https://stripe.com"},
-                {"name": "Airbnb", "website": "https://airbnb.com"},
-                {"name": "Dropbox", "website": "https://dropbox.com"},
-                {"name": "Reddit", "website": "https://reddit.com"},
-                {"name": "Pinterest", "website": "https://pinterest.com"},
-                {"name": "DoorDash", "website": "https://doordash.com"},
-                {"name": "Instacart", "website": "https://instacart.com"},
-                {"name": "Twitch", "website": "https://twitch.tv"},
-                {"name": "Figma", "website": "https://figma.com"},
-                {"name": "Notion", "website": "https://notion.so"},
-                {"name": "Canva", "website": "https://canva.com"},
-                {"name": "Checkout.com", "website": "https://checkout.com"},
-                {"name": "Nubank", "website": "https://nubank.com.br"},
-                {"name": "N26", "website": "https://n26.com"},
-                {"name": "Brex", "website": "https://brex.com"},
-                {"name": "Revolut", "website": "https://revolut.com"},
-            ]
+            raise RuntimeError("Y Combinator API unavailable - no data to fetch")
 
         # Process YC companies
         industry_keywords = [ind.lower() for ind in (industries or ["SaaS"])]
