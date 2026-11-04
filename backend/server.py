@@ -101,6 +101,8 @@ TWILIO_WHATSAPP_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "").strip()
 BACKEND_URL = os.environ.get("BACKEND_URL", "").strip().rstrip("/")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000").strip().rstrip("/")
 IS_PRODUCTION = FRONTEND_URL.startswith("https://")
+# Extra allowed browser origins (comma-separated), e.g. a dev tunnel URL
+EXTRA_ORIGINS = [o.strip().rstrip("/") for o in os.environ.get("EXTRA_CORS_ORIGINS", "").split(",") if o.strip()]
 
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
@@ -227,7 +229,7 @@ class CSRFMiddleware(BaseHTTPMiddleware):
         referer = request.headers.get("referer", "").lower().rstrip("/")
 
         if origin or referer:
-            allowed_origins = [FRONTEND_URL.lower(), BACKEND_URL.lower() if BACKEND_URL else ""]
+            allowed_origins = [FRONTEND_URL.lower(), BACKEND_URL.lower() if BACKEND_URL else ""] + [o.lower() for o in EXTRA_ORIGINS]
             allowed_origins = [o.rstrip("/") for o in allowed_origins if o]  # Normalize
             source = origin or referer
 
@@ -252,7 +254,7 @@ app.add_middleware(CSRFMiddleware)
 app.add_middleware(RequestSizeLimitMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(CORSMiddleware,
-                   allow_origins=[FRONTEND_URL],
+                   allow_origins=[FRONTEND_URL] + EXTRA_ORIGINS,
                    allow_credentials=True,
                    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
                    allow_headers=["*"])
@@ -4046,7 +4048,7 @@ app.include_router(api_router)
 app.include_router(public_router)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL],
+    allow_origins=[FRONTEND_URL] + EXTRA_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

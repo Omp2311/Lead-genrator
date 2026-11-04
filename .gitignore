@@ -52,6 +52,7 @@ __pycache__/
 *pyc*
 venv/
 .venv/
+venv*/
 
 # Generated voice-note audio (local disk storage, not source)
 backend/voice_notes/
