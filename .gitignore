@@ -93,3 +93,8 @@ credentials.json
 .credentials
 cookies.txt
 *.cookies
+
+# Runtime logs
+*.log
+!.env.example
+!backend/.env.example

@@ -26,7 +26,7 @@ import bcrypt
 import jwt
 import asyncpg
 from fastapi import FastAPI, APIRouter, Request, Response, HTTPException, Depends, UploadFile, File
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
@@ -172,6 +172,62 @@ async def integrations_status(user_id: str = None) -> dict:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("outreachpilot")
 
+_SECRET_QS = re.compile(r"(?i)\b(api_?key|apikey|key|token|access_token|client_secret|secret|password)=([^&\s\"']+)")
+
+
+class _RedactSecrets(logging.Filter):
+    """Mask API keys / tokens that appear in logged URLs (httpx logs full request URLs)."""
+
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+            red = _SECRET_QS.sub(lambda m: f"{m.group(1)}=***", msg)
+            if red != msg:
+                record.msg, record.args = red, None
+        except Exception:
+            pass
+        return True
+
+
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_RedactSecrets())
+
+# ---------------------------------------------------------------------------
+# Encryption at rest for stored mailbox credentials (SMTP password / Resend key).
+# Key: ENCRYPTION_KEY (a Fernet key) if set, else derived from JWT_SECRET.
+# Values are stored as "enc:v1:<token>"; legacy plaintext is still readable and
+# is encrypted automatically on startup.
+# ---------------------------------------------------------------------------
+import base64
+import hashlib
+from cryptography.fernet import Fernet, InvalidToken
+
+_ENC_PREFIX = "enc:v1:"
+
+
+def _fernet() -> Fernet:
+    raw = os.environ.get("ENCRYPTION_KEY", "").strip()
+    if raw:
+        return Fernet(raw.encode())
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(("enc|" + JWT_SECRET).encode()).digest()))
+
+
+def enc_secret(value: str) -> str:
+    if not value or value.startswith(_ENC_PREFIX):
+        return value or ""
+    return _ENC_PREFIX + _fernet().encrypt(value.encode()).decode()
+
+
+def dec_secret(value: str) -> str:
+    if not value or not value.startswith(_ENC_PREFIX):
+        return value or ""
+    try:
+        return _fernet().decrypt(value[len(_ENC_PREFIX):].encode()).decode()
+    except InvalidToken:
+        logger.error("Could not decrypt stored credential - ENCRYPTION_KEY/JWT_SECRET changed?")
+        return ""
+
+
 # SECURITY FIX 10: HTTPS enforcement and validation
 if IS_PRODUCTION:
     # Ensure BACKEND_URL also uses HTTPS in production
@@ -245,7 +301,8 @@ class CSRFMiddleware(BaseHTTPMiddleware):
 
             # Exact match check - not substring
             if source_origin not in allowed_origins:
-                raise HTTPException(status_code=403, detail="CSRF validation failed")
+                # Middleware runs outside FastAPI's exception handlers, so return the response directly.
+                return JSONResponse(status_code=403, content={"detail": "CSRF validation failed"})
 
         return await call_next(request)
 
@@ -965,9 +1022,9 @@ async def pick_inbox(user_id: str) -> Optional[dict]:
 
 def _inbox_to_cfg(inbox: dict) -> dict:
     if inbox["provider"] == "resend":
-        return {"provider": "resend", "resend_api_key": inbox["resend_api_key"], "from_email": inbox["from_email"]}
+        return {"provider": "resend", "resend_api_key": dec_secret(inbox["resend_api_key"]), "from_email": inbox["from_email"]}
     return {"provider": "smtp", "smtp_host": inbox["smtp_host"], "smtp_port": inbox["smtp_port"],
-            "smtp_user": inbox["smtp_user"], "smtp_password": inbox["smtp_password"],
+            "smtp_user": inbox["smtp_user"], "smtp_password": dec_secret(inbox["smtp_password"]),
             "from_email": inbox["from_email"]}
 
 async def resolve_sender_cfg(user_id: str):
@@ -1188,6 +1245,43 @@ def _is_excluded_business(company: str, industry: str) -> bool:
     return any(term in text for term in _EXCLUDED_BUSINESS_TERMS)
 
 
+_GENERIC_TARGET_WORDS = {"chain", "chains", "multiple", "independent", "service", "services", "business",
+                         "company", "companies", "group", "retail", "and", "the", "for"}
+# Extra words that signal the same sector (keyed by 5-letter stem of the target word).
+_TARGET_SYNONYMS = {"pharm": ("medic", "chemist", "drug", "apothec", "medplus", "wellness", "healthmart")}
+
+
+def _target_stems(industries) -> set:
+    stems = set()
+    for ind in industries or []:
+        for w in re.findall(r"[a-z]{3,}", str(ind).lower()):
+            if w not in _GENERIC_TARGET_WORDS:
+                st = w[:5]
+                stems.add(st)
+                stems.update(_TARGET_SYNONYMS.get(st, ()))
+    return stems
+
+
+def filter_relevant_leads(leads: list, industries) -> list:
+    """Keep only leads whose OWN name/website/title match the target industries.
+
+    Lead sources stamp the campaign's industry onto every result (e.g. a GitHub org gets
+    industry="Pharmacy"), so the stamped `industry` field is deliberately ignored here.
+    """
+    stems = _target_stems(industries)
+    if not stems:
+        return leads
+    kept = []
+    for l in leads:
+        text = " ".join(str(l.get(k, "")) for k in ("company", "website", "title")).lower()
+        if any(st in text for st in stems):
+            kept.append(l)
+    dropped = len(leads) - len(kept)
+    if dropped:
+        logger.info(f"Relevance filter dropped {dropped}/{len(leads)} off-target leads")
+    return kept
+
+
 # ---------------------------------------------------------------------------
 # Real lead sourcing via Apollo (falls back to AI demo leads)
 # ---------------------------------------------------------------------------
@@ -1195,7 +1289,7 @@ async def fetch_apollo_leads(regions, industries, count) -> List[dict]:
     global _apollo_ok
     headers = {"x-api-key": APOLLO_API_KEY, "Content-Type": "application/json",
                "Accept": "application/json", "Cache-Control": "no-cache"}
-    titles = ["CEO", "CTO", "Founder", "VP Engineering", "IT Director", "Head of Growth"]
+    titles = ["Owner", "Founder", "CEO", "Managing Director", "Director", "Chief Pharmacist"]
     params = []
     for r in regions:
         params.append(("person_locations[]", r))
@@ -1944,6 +2038,10 @@ async def source_leads(settings: dict, count: int, region=None, industry=None):
         try:
             logger.info(f"Trying {source_name}... (need {needed} more leads)")
             leads = await fetch_func()
+            # Apollo already matches on industry keyword tags server-side; the other sources just
+            # stamp the campaign's industry on whatever they find, so those get a relevance check.
+            if source_name != "Apollo":
+                leads = filter_relevant_leads(leads, industries)
 
             if leads:
                 for lead in leads:
@@ -2334,18 +2432,17 @@ async def draft_emails_for_leads(user_id: str) -> dict:
 
 async def process_due_followups(user_id: str = None) -> int:
     now = datetime.now(timezone.utc)
-    # SECURITY FIX 5: Use SELECT ... FOR UPDATE to prevent scheduler race condition
-    # This locks the rows until the transaction completes, preventing duplicate sends
+    # Atomically CLAIM due follow-ups (single UPDATE ... RETURNING with SKIP LOCKED) so two
+    # workers/ticks can never send the same follow-up twice. Deferred ones are un-claimed below.
+    claim_sql = (
+        "UPDATE emails SET processed_at=$1 WHERE id IN ("
+        "  SELECT id FROM emails WHERE type='follow_up' AND status='scheduled' "
+        "  AND scheduled_for<=$1 AND processed_at IS NULL {user_clause} "
+        "  FOR UPDATE SKIP LOCKED) RETURNING *")
     if user_id:
-        due = recs(await pool.fetch(
-            "SELECT * FROM emails WHERE type='follow_up' AND status='scheduled' "
-            "AND scheduled_for<=$1 AND user_id=$2 AND processed_at IS NULL "
-            "FOR UPDATE", now, user_id))
+        due = recs(await pool.fetch(claim_sql.format(user_clause="AND user_id=$2"), now, user_id))
     else:
-        due = recs(await pool.fetch(
-            "SELECT * FROM emails WHERE type='follow_up' AND status='scheduled' "
-            "AND scheduled_for<=$1 AND processed_at IS NULL "
-            "FOR UPDATE", now))
+        due = recs(await pool.fetch(claim_sql.format(user_clause=""), now))
     sent = 0
     for fu in due:
         lead = rec(await pool.fetchrow("SELECT * FROM leads WHERE id=$1", fu.get("lead_id")))
@@ -2355,7 +2452,9 @@ async def process_due_followups(user_id: str = None) -> int:
         fu_user_id = fu.get("user_id")
         inbox, cfg, defer_reason = await resolve_sender_cfg(fu_user_id)
         if defer_reason:
-            continue  # leave status='scheduled' — retried next tick once cap resets
+            # un-claim: leave status='scheduled' so it is retried next tick once the cap resets
+            await pool.execute("UPDATE emails SET processed_at=NULL WHERE id=$1", fu["id"])
+            continue
         result = await send_email(fu.get("to_email", ""), fu.get("subject", ""),
                                   fu.get("body", ""), allow=fu.get("deliverable", False),
                                   user_id=fu_user_id, email_id=fu["id"], cfg=cfg)
@@ -3378,9 +3477,9 @@ async def create_inbox(data: InboxInput, user: dict = Depends(get_current_user))
                               resend_api_key, from_email, daily_cap, warmup_enabled, is_active, verified_at)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *
     """, inbox_id, tid, data.label, data.provider, data.smtp_host, data.smtp_port,
-         data.smtp_user, data.smtp_password, data.resend_api_key, data.from_email, data.daily_cap,
-         data.warmup_enabled, False,  # Start as inactive until verified
-         None)  # verified_at is NULL until email verification
+         data.smtp_user, enc_secret(data.smtp_password), enc_secret(data.resend_api_key), data.from_email, data.daily_cap,
+         data.warmup_enabled, data.is_active,
+         datetime.now(timezone.utc) if data.provider == "smtp" else None)  # SMTP login was verified above
 
     inbox = rec(row)
     await _run_and_store_deliverability_check(inbox_id, data.from_email)
@@ -3402,8 +3501,8 @@ async def update_inbox(inbox_id: str, data: InboxInput, user: dict = Depends(get
     if not existing:
         raise HTTPException(status_code=404, detail="Inbox not found")
     # Keep the stored secret if the client echoed back the masked placeholder unchanged.
-    smtp_password = existing["smtp_password"] if data.smtp_password == _MASK else data.smtp_password
-    resend_api_key = existing["resend_api_key"] if data.resend_api_key == _MASK else data.resend_api_key
+    smtp_password = existing["smtp_password"] if data.smtp_password == _MASK else enc_secret(data.smtp_password)
+    resend_api_key = existing["resend_api_key"] if data.resend_api_key == _MASK else enc_secret(data.resend_api_key)
     row = await pool.fetchrow("""
         UPDATE inboxes SET label=$1, provider=$2, smtp_host=$3, smtp_port=$4, smtp_user=$5,
                             smtp_password=$6, resend_api_key=$7, from_email=$8, daily_cap=$9,
@@ -3969,9 +4068,35 @@ async def track_click(signature: str, u: str, request: Request):
 # ---------------------------------------------------------------------------
 # Background daily scheduler
 # ---------------------------------------------------------------------------
+_SCHEDULER_LOCK_ID = 727301  # arbitrary app-wide advisory lock id
+
+
+def _reset_source_flags():
+    """Forget 'blocked' states so a transient 401/429 doesn't disable a source until restart."""
+    for name in list(globals()):
+        if name.startswith("_") and name.endswith("_ok") and globals()[name] is False:
+            globals()[name] = None
+
+
 async def scheduler_loop():
     await asyncio.sleep(20)
     while True:
+        _reset_source_flags()
+        try:
+            async with pool.acquire() as lock_conn:
+                # Only one worker/process runs the scheduler; others skip this tick.
+                if await lock_conn.fetchval("SELECT pg_try_advisory_lock($1)", _SCHEDULER_LOCK_ID):
+                    try:
+                        await _scheduler_tick()
+                    finally:
+                        await lock_conn.execute("SELECT pg_advisory_unlock($1)", _SCHEDULER_LOCK_ID)
+        except Exception as e:
+            logger.error(f"Scheduler error: {e}")
+        await asyncio.sleep(3600)
+
+
+async def _scheduler_tick():
+    if True:
         try:
             today = datetime.now(timezone.utc).date()
             # Detect replies first so we don't send follow-ups to people who answered
@@ -3997,8 +4122,48 @@ async def scheduler_loop():
                 except Exception as e:
                     logger.error(f"Auto run failed for {uid}: {e}")
         except Exception as e:
-            logger.error(f"Scheduler error: {e}")
-        await asyncio.sleep(3600)
+            logger.error(f"Scheduler tick error: {e}")
+
+
+async def run_migrations(conn):
+    """Apply backend/migrations/*.sql once each, in filename order (tracked in schema_migrations)."""
+    await conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations "
+                       "(name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+    done = {r["name"] for r in await conn.fetch("SELECT name FROM schema_migrations")}
+    for f in sorted((ROOT_DIR / "migrations").glob("*.sql")):
+        if f.name in done:
+            continue
+        async with conn.transaction():
+            await conn.execute(f.read_text(encoding="utf-8"))
+            await conn.execute("INSERT INTO schema_migrations (name) VALUES ($1)", f.name)
+        logger.info(f"Applied migration {f.name}")
+
+
+async def encrypt_existing_credentials(conn):
+    rows = await conn.fetch("SELECT id, smtp_password, resend_api_key FROM inboxes "
+                            "WHERE (smtp_password <> '' AND smtp_password NOT LIKE 'enc:v1:%') "
+                            "   OR (resend_api_key <> '' AND resend_api_key NOT LIKE 'enc:v1:%')")
+    for r in rows:
+        await conn.execute("UPDATE inboxes SET smtp_password=$1, resend_api_key=$2 WHERE id=$3",
+                           enc_secret(r["smtp_password"]), enc_secret(r["resend_api_key"]), r["id"])
+    if rows:
+        logger.info(f"Encrypted credentials for {len(rows)} existing inbox(es)")
+
+
+@app.get("/health")
+async def health():
+    """Liveness probe - process is up."""
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+async def ready():
+    """Readiness probe - database reachable."""
+    try:
+        await pool.fetchval("SELECT 1")
+        return {"status": "ready"}
+    except Exception:
+        raise HTTPException(status_code=503, detail="database unavailable")
 
 
 @app.on_event("startup")
@@ -4007,6 +4172,8 @@ async def startup():
     pool = await asyncpg.create_pool(DATABASE_URL, init=_init_connection)
     async with pool.acquire() as conn:
         await conn.execute((ROOT_DIR / "schema.sql").read_text())
+        await run_migrations(conn)
+        await encrypt_existing_credentials(conn)
 
     # SECURITY FIX 2 & 10: Admin account creation - only on first startup, never auto-reset
     admin_email = os.environ.get("ADMIN_EMAIL", "").strip()

@@ -1,6 +1,10 @@
 import axios from "axios";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+// On localhost call the backend directly; on any other host (e.g. a dev tunnel)
+// use same-origin /api, which the dev server proxies to the backend, so
+// auth cookies stay first-party.
+const isLocal = ["localhost", "127.0.0.1"].includes(window.location.hostname);
+const BACKEND_URL = isLocal ? process.env.REACT_APP_BACKEND_URL : "";
 export const API = `${BACKEND_URL}/api`;
 
 const api = axios.create({
